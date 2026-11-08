@@ -1,0 +1,15 @@
+[package]
+name = "rsc-crypto"
+version = "0.1.0"
+edition = "2021"
+authors = ["RSC Chain Team", "Steeve Rocher"]
+description = "Primitivas criptográficas de RSC Chain v1"
+license = "MIT"
+publish = false
+
+[dependencies]
+sha2 = "0.10"
+ed25519-dalek = { version = "2.2", features = ["std", "zeroize", "rand_core"] }
+zeroize = { version = "1.8", features = ["zeroize_derive"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+getrandom = "0.2"

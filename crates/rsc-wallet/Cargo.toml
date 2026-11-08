@@ -1,0 +1,14 @@
+[package]
+name = "rsc-wallet"
+version = "0.1.0"
+edition = "2021"
+authors = ["RSC Chain Team", "Steeve"]
+description = "Wallet RSC: la cadena la genera y la dirección empieza por rsc"
+license = "MIT"
+publish = false
+
+[dependencies]
+getrandom = "0.2"
+rsc-crypto = { path = "../rsc-crypto" }
+sha2 = "0.10"
+zeroize = "1.8"

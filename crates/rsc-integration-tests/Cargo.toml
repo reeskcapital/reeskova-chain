@@ -1,0 +1,40 @@
+[package]
+name = "rsc-integration-tests"
+version = "0.1.0"
+edition = "2021"
+authors = ["RSC Chain Team", "Steeve"]
+description = "Harness de integración de los 12 crates de RSC Chain"
+license = "MIT"
+publish = false
+
+[dependencies]
+rsc-core = { path = "../rsc-core" }
+rsc-crypto = { path = "../rsc-crypto" }
+rsc-genesis = { path = "../rsc-genesis" }
+rsc-state = { path = "../rsc-state" }
+rsc-ledger = { path = "../rsc-ledger" }
+rsc-mempool = { path = "../rsc-mempool" }
+rsc-execution = { path = "../rsc-execution" }
+rsc-chain = { path = "../rsc-chain" }
+rsc-consensus = { path = "../rsc-consensus" }
+rsc-storage = { path = "../rsc-storage" }
+rsc-p2p = { path = "../rsc-p2p" }
+rsc-rpc = { path = "../rsc-rpc" }
+
+[dev-dependencies]
+rsc-core = { path = "../rsc-core" }
+rsc-crypto = { path = "../rsc-crypto" }
+rsc-genesis = { path = "../rsc-genesis" }
+rsc-state = { path = "../rsc-state" }
+rsc-ledger = { path = "../rsc-ledger" }
+rsc-mempool = { path = "../rsc-mempool" }
+rsc-execution = { path = "../rsc-execution" }
+rsc-chain = { path = "../rsc-chain" }
+rsc-consensus = { path = "../rsc-consensus" }
+rsc-storage = { path = "../rsc-storage" }
+rsc-p2p = { path = "../rsc-p2p" }
+rsc-rpc = { path = "../rsc-rpc" }
+serde_json = "1.0.151"
+tempfile = "3"
+tokio = { version = "1.53.1", features = ["rt"] }
+wat = "=1.254.0"

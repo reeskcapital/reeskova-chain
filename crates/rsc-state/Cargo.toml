@@ -1,0 +1,17 @@
+[package]
+name = "rsc-state"
+version = "0.1.0"
+edition = "2021"
+authors = ["RSC Chain Team", "Steeve"]
+description = "Estado lógico de cuentas, transiciones y StateRoot de RSC"
+license = "MIT"
+publish = false
+
+[dependencies]
+rsc-core = { path = "../rsc-core" }
+rsc-crypto = { path = "../rsc-crypto" }
+rsc-storage = { path = "../rsc-storage" }
+thiserror = "1.0"
+
+[dev-dependencies]
+tempfile = "3"

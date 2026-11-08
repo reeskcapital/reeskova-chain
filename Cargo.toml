@@ -1,0 +1,35 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/rsc-core",
+    "crates/rsc-crypto",
+    "crates/rsc-ledger",
+    "crates/rsc-genesis",
+    "crates/rsc-storage",
+    "crates/rsc-state",
+    "crates/rsc-mempool",
+    "crates/rsc-chain",
+    "crates/rsc-consensus",
+    "crates/rsc-rpc",
+    "crates/rsc-execution",
+    "crates/rsc-p2p",
+    "crates/rsc-bridge",
+    "crates/rsc-integration-tests",
+    "crates/rsc-wallet",
+    "crates/rsc-amm",
+    "crates/rsc-assets",
+    "crates/rsc-monetary",
+    "crates/rsc-node-tiers",
+    "network/node",
+    "network/validator",
+    "network/mobile-node",
+    "network/community-node",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["RSC Chain Team", "Steeve"]
+license = "MIT"
+repository = "https://github.com/rsc-chain/rsc_chain"
+homepage = "https://rsc-chain.com"

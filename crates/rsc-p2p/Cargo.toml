@@ -1,0 +1,57 @@
+[package]
+name = "rsc-p2p"
+version = "0.1.0"
+edition = "2021"
+authors = ["RSC Chain Team", "Steeve"]
+description = "Capa P2P de RSC Chain v1"
+license = "MIT"
+publish = false
+
+[features]
+default = []
+nat-traversal = ["libp2p/autonat", "libp2p/relay", "libp2p/dcutr"]
+lan-discovery = ["libp2p/mdns"]
+metrics = ["libp2p/metrics"]
+
+[dependencies]
+libp2p = { version = "=0.57.0", default-features = false, features = [
+    "tokio",
+    "macros",
+    "ed25519",
+    "dns",
+    "noise",
+    "quic",
+    "tcp",
+    "yamux",
+    "gossipsub",
+    "identify",
+    "kad",
+    "upnp",
+    "autonat",
+    "relay",
+    "dcutr",
+    "ping",
+    "request-response",
+    "cbor",
+    "serde",
+] }
+tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "sync", "time", "net", "signal"] }
+futures = "0.3"
+serde = { version = "1.0.228", features = ["derive"] }
+thiserror = "1.0.69"
+rsc-core = { path = "../rsc-core" }
+rsc-crypto = { path = "../rsc-crypto" }
+rsc-chain = { path = "../rsc-chain" }
+rsc-consensus = { path = "../rsc-consensus" }
+rsc-genesis = { path = "../rsc-genesis" }
+rsc-state = { path = "../rsc-state" }
+rsc-ledger = { path = "../rsc-ledger" }
+rsc-mempool = { path = "../rsc-mempool" }
+rsc-rpc = { path = "../rsc-rpc" }
+rsc-storage = { path = "../rsc-storage" }
+
+[dev-dependencies]
+tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "time"] }
+rsc-crypto = { path = "../rsc-crypto" }
+rsc-ledger = { path = "../rsc-ledger" }
+rsc-rpc = { path = "../rsc-rpc" }

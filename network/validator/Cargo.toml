@@ -1,0 +1,24 @@
+[package]
+name = "rsc-validator"
+version = "0.1.0"
+edition = "2021"
+authors = ["RSC Chain Team", "Steeve"]
+description = "Proceso validador de RSC Chain"
+license = "MIT"
+publish = false
+
+[dependencies]
+rsc-chain = { path = "../../crates/rsc-chain" }
+rsc-consensus = { path = "../../crates/rsc-consensus" }
+rsc-core = { path = "../../crates/rsc-core" }
+rsc-crypto = { path = "../../crates/rsc-crypto" }
+rsc-genesis = { path = "../../crates/rsc-genesis" }
+rsc-ledger = { path = "../../crates/rsc-ledger" }
+rsc-state = { path = "../../crates/rsc-state" }
+rsc-rpc = { path = "../../crates/rsc-rpc" }
+rsc-storage = { path = "../../crates/rsc-storage" }
+serde_json = "1.0"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time"] }
+
+[dev-dependencies]
+tempfile = "3"

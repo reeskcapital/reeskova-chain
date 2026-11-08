@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Explorador · Reeskova Chain</title>
+  <link rel="stylesheet" href="/explorer.css">
+</head>
+<body>
+  <header class="top">
+    <div class="brand">
+      <a class="mark" href="#/">Reeskova</a>
+      <p class="brand-note" id="network">cadena</p>
+    </div>
+    <form class="search" id="search">
+      <label class="sr" for="query">Buscar altura, bloque, transacción o cuenta</label>
+      <input id="query" name="query" autocomplete="off" spellcheck="false" placeholder="Altura, bloque, transacción o cuenta">
+      <button type="submit">Buscar</button>
+    </form>
+  </header>
+  <section class="stats" id="stats" aria-live="polite"></section>
+  <main id="view"></main>
+  <footer class="foot">
+    <span id="api-note"></span>
+  </footer>
+  <script src="/explorer.js"></script>
+</body>
+</html>

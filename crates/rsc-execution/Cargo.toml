@@ -1,0 +1,17 @@
+[package]
+name = "rsc-execution"
+version = "0.1.0"
+edition = "2021"
+authors = ["RSC Chain Team", "Steeve"]
+description = "Motor WASM determinista de RSC Chain v1 (RSC-WASM-V1)"
+license = "MIT"
+publish = false
+
+[dependencies]
+wasmtime = { version = "=48.0.2", default-features = false, features = ["runtime", "cranelift", "std"] }
+wasmparser = { version = "=0.254.0", default-features = false, features = ["std", "features", "validate", "component-model"] }
+thiserror = "1.0.69"
+rsc-crypto = { path = "../rsc-crypto" }
+
+[dev-dependencies]
+wat = "=1.254.0"

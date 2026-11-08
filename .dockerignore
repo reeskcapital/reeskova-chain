@@ -1,0 +1,7 @@
+target/
+.git/
+*.md
+.env
+.env.*
+run_tests.ps1
+run_tests.bat

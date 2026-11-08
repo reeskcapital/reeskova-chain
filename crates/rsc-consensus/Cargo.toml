@@ -1,0 +1,19 @@
+[package]
+name = "rsc-consensus"
+version = "0.1.0"
+edition = "2021"
+authors = ["RSC Chain Team", "Steeve"]
+description = "RSC-HS: consenso BFT estilo HotStuff encadenado"
+license = "MIT"
+publish = false
+
+[dependencies]
+rsc-core = { path = "../rsc-core" }
+rsc-chain = { path = "../rsc-chain" }
+rsc-crypto = { path = "../rsc-crypto" }
+rsc-state = { path = "../rsc-state" }
+borsh = { version = "1", features = ["derive"] }
+thiserror = "1.0"
+
+[dev-dependencies]
+proptest = "1"

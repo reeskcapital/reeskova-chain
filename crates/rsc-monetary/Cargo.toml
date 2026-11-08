@@ -1,0 +1,17 @@
+[package]
+name = "rsc-monetary"
+version = "0.1.0"
+edition = "2021"
+authors = ["RSC Chain Team", "Steeve"]
+description = "Política monetaria verificable de RSC Chain (RSK v1.0)"
+license = "MIT"
+publish = false
+
+[dependencies]
+rsc-core = { path = "../rsc-core" }
+rsc-crypto = { path = "../rsc-crypto" }
+serde = { version = "1.0", features = ["derive"] }
+thiserror = "1.0"
+
+[dev-dependencies]
+serde_json = "1.0"

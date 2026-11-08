@@ -1,0 +1,24 @@
+# RSC AMM private testnet — Stage 7
+network_id = "rsc-amm-testnet"
+chain_id = "rsc-amm-testnet"
+validators = 4
+# Quorum: 3 * power > 2 * total  ⇒ f=1 needs n=4
+min_validators_for_distributed = 4
+
+[assets.tRSK]
+decimals = 18
+symbol = "tRSK"
+
+[assets.tUSDC]
+decimals = 6
+symbol = "tUSDC"
+
+[pool.default]
+fee_bps = 30
+initial_rsk = 200000
+initial_usdc = 200000
+
+[ports]
+# Reserved base; +i for validator i
+rpc_base = 18547
+p2p_base = 48745

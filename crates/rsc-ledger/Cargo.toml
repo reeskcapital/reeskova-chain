@@ -1,0 +1,13 @@
+[package]
+name = "rsc-ledger"
+version = "0.1.0"
+edition = "2021"
+authors = ["RSC Chain Team", "Steeve"]
+description = "Transacciones canónicas y secuencia lógica del ledger de RSC"
+license = "MIT"
+publish = false
+
+[dependencies]
+rsc-core = { path = "../rsc-core" }
+rsc-crypto = { path = "../rsc-crypto" }
+thiserror = "1.0"

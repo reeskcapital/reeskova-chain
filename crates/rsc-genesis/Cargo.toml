@@ -1,0 +1,19 @@
+[package]
+name = "rsc-genesis"
+version = "0.1.0"
+edition = "2021"
+authors = ["RSC Chain Team", "Steeve"]
+description = "Definición determinista e inmutable del génesis de RSC Chain"
+license = "MIT"
+publish = false
+
+[dependencies]
+rsc-core = { path = "../rsc-core" }
+rsc-crypto = { path = "../rsc-crypto" }
+rsc-consensus = { path = "../rsc-consensus" }
+serde = { version = "1.0", features = ["derive"] }
+thiserror = "1.0"
+
+[dev-dependencies]
+rsc-state = { path = "../rsc-state" }
+serde_json = "1.0"

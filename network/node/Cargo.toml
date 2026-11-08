@@ -1,0 +1,38 @@
+[package]
+name = "rsc-node"
+version = "0.1.0"
+edition = "2021"
+authors = ["RSC Chain Team", "Steeve"]
+description = "Proceso que ensambla los crates de RSC Chain"
+license = "MIT"
+publish = false
+
+[dependencies]
+rsc-chain = { path = "../../crates/rsc-chain" }
+rsc-consensus = { path = "../../crates/rsc-consensus" }
+rsc-core = { path = "../../crates/rsc-core" }
+rsc-crypto = { path = "../../crates/rsc-crypto" }
+rsc-execution = { path = "../../crates/rsc-execution" }
+rsc-genesis = { path = "../../crates/rsc-genesis" }
+rsc-ledger = { path = "../../crates/rsc-ledger" }
+rsc-monetary = { path = "../../crates/rsc-monetary" }
+rsc-mempool = { path = "../../crates/rsc-mempool" }
+rsc-p2p = { path = "../../crates/rsc-p2p" }
+rsc-rpc = { path = "../../crates/rsc-rpc" }
+rsc-state = { path = "../../crates/rsc-state" }
+rsc-storage = { path = "../../crates/rsc-storage" }
+rsc-wallet = { path = "../../crates/rsc-wallet" }
+rsc-amm = { path = "../../crates/rsc-amm", features = ["native"] }
+rsc-assets = { path = "../../crates/rsc-assets", default-features = false, features = ["persist"] }
+serde_json = "1.0"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time"] }
+
+[features]
+default = []
+## Testnet: mint/register de assets por RPC con token admin.
+amm-admin-rpc = ["rsc-rpc/amm-admin-rpc"]
+
+[dev-dependencies]
+axum = { version = "0.8.9", features = ["json"] }
+tempfile = "3"
+tower = { version = "0.5", features = ["util"] }

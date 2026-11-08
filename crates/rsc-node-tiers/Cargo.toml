@@ -1,0 +1,8 @@
+[package]
+name = "rsc-node-tiers"
+version = "0.1.0"
+edition = "2021"
+authors = ["RSC Chain Team", "Steeve"]
+description = "Equivalencia de peso entre nodos comunitarios y móviles de RSC Chain"
+license = "MIT"
+publish = false

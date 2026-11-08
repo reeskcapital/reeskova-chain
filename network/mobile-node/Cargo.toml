@@ -1,0 +1,12 @@
+[package]
+name = "rsc-mobile-node"
+version = "0.1.0"
+edition = "2021"
+authors = ["RSC Chain Team", "Steeve"]
+description = "Cuartos de nodo móvil que mantienen nodos abiertos contra la API"
+license = "MIT"
+publish = false
+
+[dependencies]
+rsc-node-tiers = { path = "../../crates/rsc-node-tiers" }
+serde_json = "1.0"

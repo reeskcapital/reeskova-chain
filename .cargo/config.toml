@@ -1,0 +1,4 @@
+# Ejecutar solo tests unitarios del módulo chain.
+# Uso: cargo test-chain
+[alias]
+test-chain = "test chain::"

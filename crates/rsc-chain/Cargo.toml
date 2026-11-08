@@ -1,0 +1,20 @@
+[package]
+name = "rsc-chain"
+version = "0.1.0"
+edition = "2021"
+authors = ["RSC Chain Team", "Steeve"]
+description = "Estructura determinista de bloques y cadena RSC"
+license = "MIT"
+publish = false
+
+[dependencies]
+rsc-core = { path = "../rsc-core" }
+rsc-crypto = { path = "../rsc-crypto" }
+rsc-storage = { path = "../rsc-storage" }
+borsh = { version = "1", features = ["derive"] }
+thiserror = "1.0"
+
+[dev-dependencies]
+proptest = "1"
+hex = "0.4"
+tempfile = "3"

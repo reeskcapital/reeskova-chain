@@ -1,0 +1,17 @@
+# Rust build output
+/target/
+
+# Logs and local test output
+*.log
+*-out.txt
+
+# Chain runtime data, node identity, and local validator state
+/data/
+/deploy/**/var/
+/testnet/var/
+
+# Local environment
+.env
+.env.*
+*.pem
+*.key

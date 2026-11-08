@@ -1,0 +1,49 @@
+﻿# API universal + explorador en el mismo dominio (HTTP, sin certificado).
+#
+#   http://rpc.reeskova-chain.xyz/           → explorer
+#   http://rpc.reeskova-chain.xyz/health
+#   http://rpc.reeskova-chain.xyz/rpc
+#   http://rpc.reeskova-chain.xyz/community/link
+#   http://rpc.reeskova-chain.xyz/mobile/mine
+
+{
+	auto_https off
+}
+
+(rsc_routes) {
+	encode gzip
+
+	handle /community* {
+		reverse_proxy 127.0.0.1:8547
+	}
+	handle /mobile* {
+		reverse_proxy 127.0.0.1:8546
+	}
+	handle /rpc* {
+		reverse_proxy 127.0.0.1:8545
+	}
+	handle /health {
+		reverse_proxy 127.0.0.1:8545
+	}
+	handle /network {
+		reverse_proxy 127.0.0.1:8545
+	}
+	handle {
+		root * d:/rsc_chain/apps/explorer
+		try_files {path} /index.html
+		file_server
+	}
+}
+
+http://rpc.reeskova-chain.xyz {
+	import rsc_routes
+}
+
+:80 {
+	import rsc_routes
+}
+
+:8880 {
+	import rsc_routes
+}
+

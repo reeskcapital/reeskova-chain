@@ -1,0 +1,22 @@
+[package]
+name = "rsc-assets"
+version = "0.1.0"
+edition = "2021"
+authors = ["RSC Chain Team", "Steeve"]
+description = "Ledger autoritativo multi-activo de RSC Chain"
+license = "MIT"
+publish = false
+
+[features]
+default = []
+## Persistencia vía rsc-storage / RocksDB.
+persist = ["dep:rsc-storage"]
+
+[dependencies]
+rsc-core = { path = "../rsc-core" }
+rsc-crypto = { path = "../rsc-crypto" }
+rsc-storage = { path = "../rsc-storage", optional = true }
+thiserror = "1.0"
+
+[dev-dependencies]
+tempfile = "3"

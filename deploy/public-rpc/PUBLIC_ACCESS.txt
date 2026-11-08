@@ -1,0 +1,20 @@
+DOMINIO UNIVERSAL = rpc.reeskova-chain.xyz
+==========================================
+
+La blockchain no es local. Todos los nodos se ligan al dominio:
+
+  https://rpc.reeskova-chain.xyz/rpc
+  https://rpc.reeskova-chain.xyz/community/link
+  https://rpc.reeskova-chain.xyz/community/unlink
+  https://rpc.reeskova-chain.xyz/          (explorer)
+
+Para que ese dominio llegue al MUNDO (no solo tu Wi‑Fi), una de estas dos:
+
+A) Router: reenviar TCP 80 → 192.168.1.10
+B) Túnel al dominio (sin abrir router):
+   1. Autorizar Cloudflare Tunnel (login en el navegador)
+   2. powershell -File deploy\public-rpc\make-domain-global.ps1
+   3. En Porkbun: borrar A/AAAA de "rpc" y crear CNAME
+      Host rpc → <tunnel-id>.cfargotunnel.com
+
+Sin A o B, el dominio solo responde dentro de tu casa.

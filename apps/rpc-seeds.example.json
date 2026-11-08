@@ -1,0 +1,7 @@
+{
+  "endpoints": [
+    "https://rpc.reeskova-chain.xyz/rpc",
+    "http://rpc.reeskova-chain.xyz/rpc"
+  ],
+  "note": "El dominio es la forma universal de conectar. No usar localhost en producción."
+}

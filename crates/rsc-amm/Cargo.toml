@@ -1,0 +1,33 @@
+[package]
+name = "rsc-amm"
+version = "0.1.0"
+edition = "2021"
+authors = ["RSC Chain Team", "Steeve"]
+description = "Motor AMM de producto constante para RSC Chain"
+license = "MIT"
+publish = false
+
+[features]
+default = ["native"]
+## Integración con ledger/state/storage/assets (requiere RocksDB).
+native = ["dep:rsc-assets", "rsc-assets/persist", "dep:rsc-ledger", "dep:rsc-state", "dep:rsc-storage"]
+
+[dependencies]
+rsc-core = { path = "../rsc-core" }
+rsc-crypto = { path = "../rsc-crypto" }
+rsc-assets = { path = "../rsc-assets", optional = true, default-features = false }
+rsc-ledger = { path = "../rsc-ledger", optional = true }
+rsc-state = { path = "../rsc-state", optional = true }
+rsc-storage = { path = "../rsc-storage", optional = true }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "1.0"
+
+[dev-dependencies]
+proptest = "1"
+tempfile = "3"
+criterion = "0.5"
+
+[[bench]]
+name = "amm_swaps"
+harness = false
