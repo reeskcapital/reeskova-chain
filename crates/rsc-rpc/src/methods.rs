@@ -61,6 +61,9 @@ pub async fn dispatch_with_meta(
         "rsc_getValidators" => rsc_get_validators(ctx, params).await,
         "rsc_getFinality" => rsc_get_finality(ctx, params).await,
         "rsc_createWallet" => rsc_create_wallet(ctx, params).await,
+        "rsc_createNamedWallet" => rsc_create_named_wallet(ctx, params).await,
+        "rsc_openWallet" => rsc_open_wallet(ctx, params).await,
+        "rsc_lookupName" => rsc_lookup_name(ctx, params).await,
         #[cfg(feature = "amm-admin-rpc")]
         "rsc_adminRegisterAsset" => rsc_admin_register_asset(ctx, params, meta).await,
         #[cfg(feature = "amm-admin-rpc")]
@@ -110,6 +113,53 @@ async fn rsc_create_wallet(ctx: &RpcContext, params: Option<&Value>) -> Result<V
     no_params(params)?;
     let wallet = ctx.node.create_wallet().await.map_err(map_service_error)?;
     serde_json::to_value(wallet).map_err(|_| RpcError::InternalError)
+}
+
+/// `rsc_createNamedWallet` — reserva el nombre y crea la wallet.
+/// Params: `{ "name", "password" }`. La contraseña no se devuelve.
+async fn rsc_create_named_wallet(
+    ctx: &RpcContext,
+    params: Option<&Value>,
+) -> Result<Value, RpcError> {
+    let map = named_params(params)?;
+    reject_unknown_keys(map, &["name", "password"])?;
+    let name = require_string(map, "name")?;
+    let password = require_string(map, "password")?;
+    let wallet = ctx
+        .node
+        .register_named_wallet(name, password)
+        .await
+        .map_err(map_service_error)?;
+    serde_json::to_value(wallet).map_err(|_| RpcError::InternalError)
+}
+
+/// `rsc_openWallet` — frase y contraseña abren la wallet de ese nombre.
+/// Params: `{ "name", "seed_phrase", "password" }`.
+async fn rsc_open_wallet(ctx: &RpcContext, params: Option<&Value>) -> Result<Value, RpcError> {
+    let map = named_params(params)?;
+    reject_unknown_keys(map, &["name", "seed_phrase", "password"])?;
+    let name = require_string(map, "name")?;
+    let phrase = require_string(map, "seed_phrase")?;
+    let password = require_string(map, "password")?;
+    let wallet = ctx
+        .node
+        .open_named_wallet(name, phrase, password)
+        .await
+        .map_err(map_service_error)?;
+    serde_json::to_value(wallet).map_err(|_| RpcError::InternalError)
+}
+
+/// `rsc_lookupName` — dirección pública del nombre. Params: `{ "name" }`.
+async fn rsc_lookup_name(ctx: &RpcContext, params: Option<&Value>) -> Result<Value, RpcError> {
+    let map = named_params(params)?;
+    reject_unknown_keys(map, &["name"])?;
+    let name = require_string(map, "name")?;
+    let record = ctx
+        .node
+        .lookup_name(name)
+        .await
+        .map_err(map_service_error)?;
+    serde_json::to_value(record).map_err(|_| RpcError::InternalError)
 }
 
 /// `rsc_getStatus` — lectura. Estado de cadena, no liveness HTTP.

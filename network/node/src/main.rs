@@ -3,6 +3,7 @@
 use std::collections::VecDeque;
 use std::env;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -39,6 +40,8 @@ use rsc_state::{
     GenesisAccount as StateGenesisAccount, State, StateError, StateOperation, StateTransition,
 };
 use rsc_storage::{ColumnFamily, DatabaseConfig, RscDatabase, StorageBatch, StorageError};
+
+mod names;
 
 /// Tope de valor que `DatabaseConfig` exige para abrir. No entra en la identidad.
 const MAX_VALUE_SIZE: usize = 8 * 1024 * 1024;
@@ -1421,6 +1424,7 @@ struct NodeRpc {
     wallets: Arc<Mutex<VecDeque<WalletOpening>>>,
     /// Directorio discovery: self + seeds (+ file). Sin API fija obligatoria.
     rpc_endpoints: Vec<RpcEndpoint>,
+    names: Arc<names::NameBook>,
 }
 
 #[cfg(test)]
@@ -1452,6 +1456,9 @@ fn shared_chain(
     }));
     let wallets = Arc::new(Mutex::new(VecDeque::new()));
     let rpc_endpoints = build_rpc_directory(config);
+    let names = Arc::new(names::NameBook::open(
+        PathBuf::from(&config.data_dir).join("wallet-names.json"),
+    ));
     let node = Arc::new(NodeRpc {
         network_id: config.network_id.clone(),
         chain_id: config.chain_id,
@@ -1459,6 +1466,7 @@ fn shared_chain(
         pool,
         wallets: Arc::clone(&wallets),
         rpc_endpoints,
+        names,
     });
     let context = RpcContext::new(
         Arc::clone(&node) as Arc<dyn NodeService>,
@@ -2110,6 +2118,96 @@ impl NodeService for NodeRpc {
             Err(_) => return failed(ServiceError::Internal),
         }
         ready(response)
+    }
+
+    fn register_named_wallet(
+        &self,
+        name: &str,
+        password: &str,
+    ) -> ServiceFut<'_, rsc_rpc::RpcWallet> {
+        let (key, display) = match names::normalize(name) {
+            Ok(pair) => pair,
+            Err(()) => return failed(ServiceError::InvalidState),
+        };
+        let (password_salt, password_hash) = match names::seal_password(password) {
+            Ok(sealed) => sealed,
+            Err(()) => return failed(ServiceError::InvalidState),
+        };
+        if self.names.lookup(&display).is_ok() {
+            return failed(ServiceError::InvalidState);
+        }
+        let wallet = match rsc_wallet::Wallet::generate() {
+            Ok(wallet) => wallet,
+            Err(_) => return failed(ServiceError::Internal),
+        };
+        let opening = match creation_transaction(&wallet) {
+            Ok(opening) => opening,
+            Err(_) => return failed(ServiceError::Internal),
+        };
+        let record = names::NameRecord {
+            name: display,
+            address: wallet.address().to_string(),
+            account_id: wallet.account_id_hex(),
+            public_key: wallet.public_key_hex(),
+            password_salt,
+            password_hash,
+        };
+        if self.names.insert(record).is_err() {
+            return failed(ServiceError::InvalidState);
+        }
+        let response = wallet_response(&wallet);
+        match self.wallets.lock() {
+            Ok(mut queue) => queue.push_back(opening),
+            Err(_) => return failed(ServiceError::Internal),
+        }
+        let _ = key;
+        ready(response)
+    }
+
+    fn open_named_wallet(
+        &self,
+        name: &str,
+        phrase: &str,
+        password: &str,
+    ) -> ServiceFut<'_, rsc_rpc::RpcWallet> {
+        let record = match self.names.lookup(name) {
+            Ok(record) => record,
+            Err(()) => return failed(ServiceError::NotFound),
+        };
+        let password_ok = record.password_hash.is_empty() || names::password_matches(&record, password);
+        if !password_ok {
+            return failed(ServiceError::InvalidState);
+        }
+        let wallet = match rsc_wallet::Wallet::from_phrase(phrase) {
+            Ok(wallet) => wallet,
+            Err(_) => return failed(ServiceError::InvalidState),
+        };
+        if wallet.account_id_hex() != record.account_id || wallet.address() != record.address {
+            return failed(ServiceError::InvalidState);
+        }
+        ready(wallet_response(&wallet))
+    }
+
+    fn lookup_name(&self, name: &str) -> ServiceFut<'_, rsc_rpc::RpcNameRecord> {
+        match self.names.lookup(name) {
+            Ok(record) => ready(rsc_rpc::RpcNameRecord {
+                name: record.name,
+                address: record.address,
+                account_id: record.account_id,
+                public_key: record.public_key,
+            }),
+            Err(()) => failed(ServiceError::NotFound),
+        }
+    }
+}
+
+fn wallet_response(wallet: &rsc_wallet::Wallet) -> rsc_rpc::RpcWallet {
+    rsc_rpc::RpcWallet {
+        address: wallet.address().to_string(),
+        account_id: wallet.account_id_hex(),
+        public_key: wallet.public_key_hex(),
+        signing_key: wallet.signing_key_hex(),
+        seed_phrase: wallet.seed_phrase().to_string(),
     }
 }
 

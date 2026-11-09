@@ -84,6 +84,9 @@ pub fn build_router(ctx: RpcContext, config: RpcConfig) -> Router {
         .route("/swap/quote", post(swap_quote))
         .route("/swap/liquidity", post(swap_liquidity))
         .route("/swap/submit", post(swap_submit))
+        .route("/wallet", get(wallet_lookup))
+        .route("/wallet/create", post(wallet_create))
+        .route("/wallet/login", post(wallet_login))
         .layer(RequestBodyLimitLayer::new(max_body))
         .layer(TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,
@@ -249,6 +252,23 @@ async fn swap_liquidity(State(state): State<AppState>, Json(body): Json<Value>) 
 
 async fn swap_submit(State(state): State<AppState>, Json(body): Json<Value>) -> Response {
     swap_call(&state, "rsc_sendTransaction", body).await
+}
+
+#[derive(Deserialize)]
+struct NameQuery {
+    name: String,
+}
+
+async fn wallet_lookup(State(state): State<AppState>, Query(q): Query<NameQuery>) -> Response {
+    swap_call(&state, "rsc_lookupName", json!({ "name": q.name })).await
+}
+
+async fn wallet_create(State(state): State<AppState>, Json(body): Json<Value>) -> Response {
+    swap_call(&state, "rsc_createNamedWallet", body).await
+}
+
+async fn wallet_login(State(state): State<AppState>, Json(body): Json<Value>) -> Response {
+    swap_call(&state, "rsc_openWallet", body).await
 }
 
 async fn swap_call(state: &AppState, method: &str, params: Value) -> Response {

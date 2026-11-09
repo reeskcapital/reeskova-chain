@@ -3750,6 +3750,7 @@ name = "rsc-node"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "getrandom 0.2.17",
  "rsc-amm",
  "rsc-assets",
  "rsc-chain",
@@ -3766,6 +3767,7 @@ dependencies = [
  "rsc-state",
  "rsc-storage",
  "rsc-wallet",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",

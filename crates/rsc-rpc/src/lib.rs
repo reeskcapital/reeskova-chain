@@ -516,6 +516,15 @@ pub struct RpcWallet {
     pub seed_phrase: String,
 }
 
+/// Nombre público ligado a una wallet. No incluye frase ni clave.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RpcNameRecord {
+    pub name: String,
+    pub address: String,
+    pub account_id: String,
+    pub public_key: String,
+}
+
 /// Future object-safe de un servicio interno.
 pub type ServiceFut<'a, T> = Pin<Box<dyn Future<Output = Result<T, ServiceError>> + Send + 'a>>;
 
@@ -535,6 +544,27 @@ pub trait NodeService: Send + Sync {
 
     /// El nodo genera la wallet. Quien no la implementa no la ofrece.
     fn create_wallet(&self) -> ServiceFut<'_, RpcWallet> {
+        Box::pin(async { Err(ServiceError::Unavailable) })
+    }
+
+    /// Crea una wallet y reserva `name`. El nombre repetido se rechaza.
+    /// `password` solo se usa para armar el verificador; no se guarda ni firma.
+    fn register_named_wallet(&self, _name: &str, _password: &str) -> ServiceFut<'_, RpcWallet> {
+        Box::pin(async { Err(ServiceError::Unavailable) })
+    }
+
+    /// Abre la wallet del nombre si la frase y la contraseña son las de esa cuenta.
+    fn open_named_wallet(
+        &self,
+        _name: &str,
+        _phrase: &str,
+        _password: &str,
+    ) -> ServiceFut<'_, RpcWallet> {
+        Box::pin(async { Err(ServiceError::Unavailable) })
+    }
+
+    /// Datos públicos del nombre. Sin frase ni clave.
+    fn lookup_name(&self, _name: &str) -> ServiceFut<'_, RpcNameRecord> {
         Box::pin(async { Err(ServiceError::Unavailable) })
     }
 }
