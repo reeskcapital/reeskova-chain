@@ -1592,7 +1592,7 @@ fn serve_rpc(
             let mut rpc =
                 tokio::spawn(async move { server.run().await.map_err(|err| err.to_string()) });
             wait_rpc(&mut rpc, bind).await?;
-            eprintln!("rpc bind {bind} GET /health GET /network POST /rpc");
+            eprintln!("rpc bind {bind} GET /health GET /network GET /swap POST /rpc");
             let mut network = match start_p2p(p2p).await {
                 Ok(network) => network,
                 Err(err) => {

@@ -28,6 +28,9 @@
 	handle /network {
 		reverse_proxy 127.0.0.1:8545
 	}
+	handle /swap* {
+		reverse_proxy 127.0.0.1:8545
+	}
 	handle {
 		root * d:/rsc_chain/apps/explorer
 		try_files {path} /index.html

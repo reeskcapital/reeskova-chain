@@ -61,7 +61,6 @@ Start-Logged "rsc-node" $NodeBin @(
   "--rpc-bind", "127.0.0.1:8545",
   "--rpc-public-url", $Api,
   "--rpc-seed", $Api,
-  "--rpc-cors", "*",
   "--rpc-cors", "http://rpc.reeskova-chain.xyz"
 ) | Out-Null
 

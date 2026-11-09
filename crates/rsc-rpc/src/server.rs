@@ -10,11 +10,13 @@
 //! cambian de status por método.
 
 use axum::body::Bytes;
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::{header, HeaderMap, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
+use axum::Json;
 use axum::Router;
+use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
 use tower_http::cors::{AllowOrigin, CorsLayer};
@@ -72,6 +74,16 @@ pub fn build_router(ctx: RpcContext, config: RpcConfig) -> Router {
         .route("/rpc", post(rpc_entry).get(method_not_allowed))
         .route("/health", get(health).post(method_not_allowed))
         .route("/network", get(network_directory).post(method_not_allowed))
+        .route("/swap", get(swap_index))
+        .route("/swap/pools", get(swap_pools))
+        .route("/swap/pool", get(swap_pool))
+        .route("/swap/assets", get(swap_assets))
+        .route("/swap/balances", get(swap_balances))
+        .route("/swap/balance", get(swap_balance))
+        .route("/swap/position", get(swap_position))
+        .route("/swap/quote", post(swap_quote))
+        .route("/swap/liquidity", post(swap_liquidity))
+        .route("/swap/submit", post(swap_submit))
         .layer(RequestBodyLimitLayer::new(max_body))
         .layer(TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,
@@ -153,6 +165,112 @@ async fn network_directory(State(state): State<AppState>) -> Response {
 
 async fn method_not_allowed() -> impl IntoResponse {
     StatusCode::METHOD_NOT_ALLOWED
+}
+
+/// API HTTP del swap (AMM). Misma cadena que `/rpc`, rutas propias para la app.
+async fn swap_index() -> impl IntoResponse {
+    Json(json!({
+        "name": "rsc-swap",
+        "pools": "GET /swap/pools",
+        "pool": "GET /swap/pool?pool_id=",
+        "assets": "GET /swap/assets",
+        "balances": "GET /swap/balances?account=",
+        "balance": "GET /swap/balance?account=&asset_id=",
+        "position": "GET /swap/position?pool_id=&account=",
+        "quote": "POST /swap/quote",
+        "liquidity": "POST /swap/liquidity",
+        "submit": "POST /swap/submit"
+    }))
+}
+
+#[derive(Deserialize)]
+struct PoolQuery {
+    pool_id: String,
+}
+
+#[derive(Deserialize)]
+struct AccountQuery {
+    account: String,
+}
+
+#[derive(Deserialize)]
+struct BalanceQuery {
+    account: String,
+    asset_id: String,
+}
+
+#[derive(Deserialize)]
+struct PositionQuery {
+    pool_id: String,
+    account: String,
+}
+
+async fn swap_pools(State(state): State<AppState>) -> Response {
+    swap_call(&state, "rsc_getPools", json!({})).await
+}
+
+async fn swap_assets(State(state): State<AppState>) -> Response {
+    swap_call(&state, "rsc_getAssets", json!({})).await
+}
+
+async fn swap_pool(State(state): State<AppState>, Query(q): Query<PoolQuery>) -> Response {
+    swap_call(&state, "rsc_getPool", json!({ "pool_id": q.pool_id })).await
+}
+
+async fn swap_balances(State(state): State<AppState>, Query(q): Query<AccountQuery>) -> Response {
+    swap_call(&state, "rsc_getAssetBalances", json!({ "account": q.account })).await
+}
+
+async fn swap_balance(State(state): State<AppState>, Query(q): Query<BalanceQuery>) -> Response {
+    swap_call(
+        &state,
+        "rsc_getAssetBalance",
+        json!({ "account": q.account, "asset_id": q.asset_id }),
+    )
+    .await
+}
+
+async fn swap_position(State(state): State<AppState>, Query(q): Query<PositionQuery>) -> Response {
+    swap_call(
+        &state,
+        "rsc_getLpPosition",
+        json!({ "pool_id": q.pool_id, "account": q.account }),
+    )
+    .await
+}
+
+async fn swap_quote(State(state): State<AppState>, Json(body): Json<Value>) -> Response {
+    swap_call(&state, "rsc_quoteSwap", body).await
+}
+
+async fn swap_liquidity(State(state): State<AppState>, Json(body): Json<Value>) -> Response {
+    swap_call(&state, "rsc_quoteAddLiquidity", body).await
+}
+
+async fn swap_submit(State(state): State<AppState>, Json(body): Json<Value>) -> Response {
+    swap_call(&state, "rsc_sendTransaction", body).await
+}
+
+async fn swap_call(state: &AppState, method: &str, params: Value) -> Response {
+    match crate::methods::dispatch_with_meta(
+        &state.ctx,
+        method,
+        Some(&params),
+        &RpcCallMeta::default(),
+    )
+    .await
+    {
+        Ok(result) => (StatusCode::OK, Json(json!({ "ok": true, "result": result }))).into_response(),
+        Err(err) => {
+            let status = match err {
+                RpcError::NotFound => StatusCode::NOT_FOUND,
+                RpcError::InvalidParams | RpcError::ParseError => StatusCode::BAD_REQUEST,
+                RpcError::ServiceUnavailable => StatusCode::SERVICE_UNAVAILABLE,
+                _ => StatusCode::BAD_REQUEST,
+            };
+            (status, Json(failure(crate::RpcId::Null, err))).into_response()
+        }
+    }
 }
 
 async fn rpc_entry(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
