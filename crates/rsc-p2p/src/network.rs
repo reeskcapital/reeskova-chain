@@ -1104,7 +1104,7 @@ fn handle_behaviour(
                 request, channel, ..
             } => {
                 if let RscRequest::Handshake(offer) = &request {
-                    let (ok, err) = evaluate_handshake(&state.config, offer);
+                    let (ok, err) = evaluate_handshake(&state.config, &offer);
                     let reply = HandshakeReply {
                         accepted: ok,
                         reason: err.map(|e| e.to_string()),

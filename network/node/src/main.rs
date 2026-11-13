@@ -1,4 +1,4 @@
-//! Lee la configuración, abre una base, escribe el bloque 0 si falta el tip, reconstruye el ledger, arranca mempool, ejecución y consenso, propone el tip, cierra el FinalityProof local, avanza la altura del motor, admite transacciones, confirma en un lote la que está Ready, alinea el motor con ese tip, sirve RPC, escucha P2P y sella un bloque por intervalo.
+//! Lee la configuración, abre una base, escribe el bloque 0 si falta el tip, reconstruye el ledger, arranca el mempool y el swarm. El motor de consenso solo existe si el génesis trae un comité. Este proceso no sella, no vota y no fabrica pruebas de finality.
 
 use std::collections::VecDeque;
 use std::env;
@@ -23,11 +23,16 @@ use rsc_genesis::GenesisAllocationCategory;
 use rsc_genesis::{Genesis, NetworkParameters};
 use rsc_ledger::{Ledger, Transaction, TransactionPayload, TRANSACTION_VERSION_V1};
 use rsc_mempool::{
-    Mempool, MempoolConfig, MempoolTransaction, MempoolValidationError, MempoolValidator,
-    NonceLookupError, PendingNonceProvider,
+    Mempool, MempoolConfig, MempoolError, MempoolTransaction, MempoolValidationError,
+    MempoolValidator, NonceLookupError, PendingNonceProvider,
 };
-use rsc_monetary::{protocol_fee_pool_key_id, EmissionCategory, MonetaryRuntime};
-use rsc_p2p::{DiscoveryConfig, LocalPeerIdentity, NetworkConfig, NetworkEvent, RscNetwork};
+use rsc_monetary::{
+    protocol_fee_pool_key_id, security_vault_key_id, EmissionCategory, MonetaryRuntime,
+};
+use rsc_p2p::{
+    classify_ingress, DiscoveryConfig, GossipAcceptance, GossipTopic, Ingress, LocalPeerIdentity,
+    NetworkConfig, NetworkEvent, NetworkHandle, RscNetwork,
+};
 use rsc_rpc::{
     decode_hex, encode_hex, merge_rpc_endpoints, normalize_rpc_url, AmmService, ChainService,
     ConsensusService, NodeService, RpcAccount, RpcAddLiquidityQuote, RpcAsset, RpcAssetBalance,
@@ -83,6 +88,10 @@ struct Config {
     rpc_public_url: Option<String>,
     /// Semillas RPC (`--rpc-seed` repetible / `RSC_RPC_SEEDS` CSV / `rpc-seeds.json`).
     rpc_seeds: Vec<String>,
+    /// Nodos ya conocidos (`--peer` repetible). No es un registro central.
+    p2p_peers: Vec<String>,
+    /// `--registry-url`. `None` usa `RSC_REGISTRY_URL` o el registro local.
+    registry_url: Option<String>,
 }
 
 fn main() -> ExitCode {
@@ -115,14 +124,21 @@ fn main() -> ExitCode {
         eprintln!("{err}");
         return ExitCode::from(1);
     }
-    let (pool, execution, mut consensus) = match open_services(&store) {
+    let (pool, execution) = match open_pool(&store) {
         Ok(services) => services,
         Err(err) => {
             eprintln!("{err}");
             return ExitCode::from(1);
         }
     };
-    if let Err(err) = resume(&state, &store, &pool, &mut consensus) {
+    let consensus = match open_observer(&store, &config) {
+        Ok(engine) => engine,
+        Err(err) => {
+            eprintln!("{err}");
+            return ExitCode::from(1);
+        }
+    };
+    if let Err(err) = note_local_chain(&store, consensus.is_some()) {
         eprintln!("{err}");
         return ExitCode::from(1);
     }
@@ -411,21 +427,7 @@ impl PendingNonceProvider for ChainAdmission {
     }
 }
 
-fn node_bootstrap_signer() -> rsc_crypto::PrivateKey {
-    rsc_crypto::PrivateKey::from_bytes(&[0u8; 32]).expect("32 bytes")
-}
-
-fn open_services(
-    store: &RocksDbChainStore,
-) -> Result<(Arc<Mempool>, ExecutionEngine, ConsensusEngine), String> {
-    let tip = store
-        .get_canonical_tip()
-        .map_err(|err| err.to_string())?
-        .ok_or("falta tip")?;
-    let block = store
-        .get_block(&tip)
-        .map_err(|err| err.to_string())?
-        .ok_or("bloque ausente")?;
+fn open_pool(store: &RocksDbChainStore) -> Result<(Arc<Mempool>, ExecutionEngine), String> {
     let minimum_fee = load_network_parameters(store.database().as_ref())
         .map(|params| params.minimum_fee)
         .unwrap_or(0);
@@ -440,6 +442,106 @@ fn open_services(
     ));
     let execution =
         ExecutionEngine::new(ExecutionConfig::default()).map_err(|err| err.to_string())?;
+    Ok((pool, execution))
+}
+
+fn open_observer(
+    store: &RocksDbChainStore,
+    config: &Config,
+) -> Result<Option<ConsensusEngine>, String> {
+    let Some(path) = config.genesis.as_deref() else {
+        return Ok(None);
+    };
+    let text = std::fs::read_to_string(path).map_err(|err| err.to_string())?;
+    let genesis: Genesis = serde_json::from_str(&text).map_err(|err| err.to_string())?;
+    genesis.validate().map_err(|err| err.to_string())?;
+    if genesis.chain_id.0 != config.chain_id {
+        return Err("chain-id del genesis distinto".into());
+    }
+    let set = genesis.validator_set().map_err(|err| err.to_string())?;
+    if !set.validators.iter().any(|validator| validator.eligible) {
+        return Ok(None);
+    }
+    let tip = store
+        .get_canonical_tip()
+        .map_err(|err| err.to_string())?
+        .ok_or("falta tip")?;
+    let block = store
+        .get_block(&tip)
+        .map_err(|err| err.to_string())?
+        .ok_or("bloque ausente")?;
+    let consensus_config = genesis
+        .parameters
+        .consensus_config()
+        .map_err(|err| err.to_string())?;
+    match ConsensusEngine::new(
+        consensus_config,
+        set,
+        genesis.parameters.consensus_randomness_seed,
+        AccountId::ZERO,
+        block.header.height.0,
+    ) {
+        Ok(engine) => {
+            if engine
+                .state()
+                .committee
+                .members
+                .iter()
+                .any(|member| member.validator_id == AccountId::ZERO)
+            {
+                return Err(
+                    "el observador coincide con un validador del génesis; no se abre el motor"
+                        .into(),
+                );
+            }
+            Ok(Some(engine))
+        }
+        Err(rsc_consensus::ConsensusError::EmptyCommittee) => Ok(None),
+        Err(err) => Err(err.to_string()),
+    }
+}
+
+fn extension_warning(height: u64, committee: bool) -> Option<&'static str> {
+    if height > 0 && !committee {
+        Some("cadena local por encima del génesis sin comité autorizado; no se extiende ni se borra")
+    } else {
+        None
+    }
+}
+
+fn note_local_chain(store: &RocksDbChainStore, committee: bool) -> Result<(), String> {
+    let tip = store
+        .get_canonical_tip()
+        .map_err(|err| err.to_string())?
+        .ok_or("falta tip")?;
+    let block = store
+        .get_block(&tip)
+        .map_err(|err| err.to_string())?
+        .ok_or("bloque ausente")?;
+    if let Some(warning) = extension_warning(block.header.height.0, committee) {
+        eprintln!("{warning}");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn node_bootstrap_signer() -> rsc_crypto::PrivateKey {
+    rsc_crypto::PrivateKey::from_bytes(&[0u8; 32]).expect("32 bytes")
+}
+
+#[cfg(test)]
+fn open_services(
+    store: &RocksDbChainStore,
+) -> Result<(Arc<Mempool>, ExecutionEngine, ConsensusEngine), String> {
+    let (pool, execution) = open_pool(store)?;
+    let tip = store
+        .get_canonical_tip()
+        .map_err(|err| err.to_string())?
+        .ok_or("falta tip")?;
+    let block = store
+        .get_block(&tip)
+        .map_err(|err| err.to_string())?
+        .ok_or("bloque ausente")?;
     let signer = node_bootstrap_signer();
     let consensus = ConsensusEngine::new(
         ConsensusConfig {
@@ -832,6 +934,7 @@ fn commit_created(
     Ok(())
 }
 
+#[cfg(test)]
 fn align_engine(
     state: &State,
     store: &RocksDbChainStore,
@@ -874,6 +977,7 @@ fn align_engine(
     Ok(())
 }
 
+#[cfg(test)]
 fn resume(
     state: &State,
     store: &RocksDbChainStore,
@@ -893,10 +997,227 @@ fn resume(
     Ok(())
 }
 
-/// Sella el bloque que el motor ya está esperando y lo finaliza en local.
+const SECURITY_SEATS_KEY: &[u8] = b"RSC/MONETARY/V1/SEATS";
+
+/// Lee `security-seats.json` del directorio de datos y lo deja en la base.
 ///
-/// Con una wallet pendiente, el bloque abre esa cuenta. Si no, entra una
-/// transferencia Ready, o el bloque queda vacío. El llamador es `serve_rpc`.
+/// Cada entrada es un asiento que puede cobrar: `community` con una persona,
+/// o `mobile` con cuatro. Si el archivo no está, el nodo paga a los
+/// miembros reales del comité. Sin gente que cobre, el subsidio no se emite.
+fn refresh_security_roster(store: &RocksDbChainStore, data_dir: &str) -> Result<(), String> {
+    let path = std::path::Path::new(data_dir).join("security-seats.json");
+    if !path.exists() {
+        return Ok(());
+    }
+    let text = std::fs::read_to_string(&path).map_err(|err| err.to_string())?;
+    let seats: Vec<rsc_monetary::SecuritySeat> =
+        serde_json::from_str(&text).map_err(|err| err.to_string())?;
+    let bytes = serde_json::to_vec(&seats).map_err(|err| err.to_string())?;
+    store
+        .database()
+        .put(ColumnFamily::Default, SECURITY_SEATS_KEY, &bytes)
+        .map_err(|err| err.to_string())
+}
+
+fn load_security_roster(store: &RocksDbChainStore) -> Vec<rsc_monetary::SecuritySeat> {
+    let Ok(Some(bytes)) = store.database().get(ColumnFamily::Default, SECURITY_SEATS_KEY) else {
+        return Vec::new();
+    };
+    serde_json::from_slice(bytes.as_bytes()).unwrap_or_default()
+}
+
+fn state_id(account: rsc_core::AccountId) -> Result<rsc_state::AccountId, String> {
+    rsc_state::AccountId::from_bytes(&account.0).map_err(|err| err.to_string())
+}
+
+fn account_balance(state: &State, account: &rsc_state::AccountId) -> Result<u128, String> {
+    Ok(state
+        .get_account(account)
+        .map_err(|err| err.to_string())?
+        .map(|account| account.native_balance())
+        .unwrap_or(0))
+}
+
+fn seat_is_payable(state: &State, seat: &rsc_monetary::SecuritySeat) -> bool {
+    seat.accounts().iter().all(|account| {
+        state_id(*account)
+            .ok()
+            .and_then(|id| state.get_account(&id).ok().flatten())
+            .is_some()
+    })
+}
+
+fn committee_seats(state: &State, consensus: &ConsensusEngine) -> Vec<rsc_monetary::SecuritySeat> {
+    let mut seats = Vec::new();
+    for member in &consensus.state().committee.members {
+        if member.validator_id == rsc_core::AccountId::ZERO {
+            continue;
+        }
+        let Ok(id) = state_id(member.validator_id) else {
+            continue;
+        };
+        if state.get_account(&id).ok().flatten().is_none() {
+            continue;
+        }
+        seats.push(rsc_monetary::SecuritySeat::community(member.validator_id));
+    }
+    seats
+}
+
+fn active_security_seats(
+    state: &State,
+    store: &RocksDbChainStore,
+    consensus: &ConsensusEngine,
+) -> Vec<rsc_monetary::SecuritySeat> {
+    let roster: Vec<_> = load_security_roster(store)
+        .into_iter()
+        .filter(|seat| seat_is_payable(state, seat))
+        .collect();
+    let committee = committee_seats(state, consensus);
+    if committee.is_empty() {
+        roster
+    } else if roster.is_empty() {
+        committee
+    } else {
+        let ids: Vec<_> = committee
+            .iter()
+            .flat_map(|seat| seat.accounts())
+            .collect();
+        let matched: Vec<_> = roster
+            .iter()
+            .filter(|seat| seat.accounts().iter().any(|account| ids.contains(account)))
+            .cloned()
+            .collect();
+        if matched.is_empty() {
+            committee
+        } else {
+            matched
+        }
+    }
+}
+
+fn genesis_timestamp_of(store: &RocksDbChainStore, start: BlockHash) -> Result<u64, String> {
+    let mut hash = start;
+    for _ in 0..1_000_000 {
+        let block = store
+            .get_block(&hash)
+            .map_err(|err| err.to_string())?
+            .ok_or("bloque ausente")?;
+        if block.header.height.0 == 0 {
+            return Ok(block.header.timestamp.0);
+        }
+        hash = block.header.previous_block_hash;
+    }
+    Err("génesis no encontrado".into())
+}
+
+/// Liquida el subsidio de minería y el 70% de las comisiones del día.
+///
+/// Cada persona cobra lo mismo: 0,10 RSK al día hasta 900 personas, y
+/// después una parte de los 90 RSK del día. Un móvil 4/4 son cuatro
+/// personas. Sin gente que cobre, el subsidio de ese día no se emite.
+/// Lo que no se puede entregar se queda en la bóveda de seguridad, no en
+/// el fee pool.
+fn settle_security(
+    state: &State,
+    store: &RocksDbChainStore,
+    consensus: &ConsensusEngine,
+    block_timestamp: u64,
+) -> Result<(), String> {
+    let mut runtime = match load_monetary_runtime(store.database().as_ref()) {
+        Ok(runtime) => runtime,
+        Err(_) => return Ok(()),
+    };
+    if !runtime.security_armed {
+        let tip = store
+            .get_canonical_tip()
+            .map_err(|err| err.to_string())?
+            .ok_or("falta tip")?;
+        runtime
+            .arm_security(genesis_timestamp_of(store, tip)?)
+            .map_err(|err| err.to_string())?;
+        persist_monetary_runtime(store.database().as_ref(), &runtime)?;
+    }
+    let Some(day) = runtime.open_day(block_timestamp) else {
+        return Ok(());
+    };
+    if day <= runtime.settled_days {
+        return Ok(());
+    }
+    let seats = active_security_seats(state, store, consensus);
+    let payees = u64::try_from(rsc_monetary::payee_accounts(&seats).len()).unwrap_or(0);
+    let mint = runtime.subsidy_due(block_timestamp, payees);
+    let fee_pool = derive_account_id(&protocol_fee_pool_key_id());
+    let vault_key = security_vault_key_id();
+    let vault = derive_account_id(&vault_key);
+    let fee_balance = account_balance(state, &fee_pool)?;
+    let vault_exists = state
+        .get_account(&vault)
+        .map_err(|err| err.to_string())?
+        .is_some();
+    let vault_balance = if vault_exists {
+        account_balance(state, &vault)?
+    } else {
+        0
+    };
+    let pot = mint
+        .checked_add(fee_balance)
+        .and_then(|sum| sum.checked_add(vault_balance))
+        .ok_or("premio de seguridad desborda")?;
+    if pot == 0 {
+        runtime
+            .note_security_subsidy(day, 0)
+            .map_err(|err| err.to_string())?;
+        persist_monetary_runtime(store.database().as_ref(), &runtime)?;
+        return Ok(());
+    }
+    let credits = rsc_monetary::split_security_pot(pot, &seats);
+    let mut payouts = Vec::new();
+    for (account, amount) in credits {
+        let id = state_id(account)?;
+        if state
+            .get_account(&id)
+            .map_err(|err| err.to_string())?
+            .is_some()
+        {
+            payouts.push((id, amount));
+        }
+    }
+    runtime
+        .note_security_subsidy(day, mint)
+        .map_err(|err| err.to_string())?;
+    let runtime_bytes = serde_json::to_vec(&runtime).map_err(|err| err.to_string())?;
+    let root = state.state_root().map_err(|err| err.to_string())?;
+    let version = state.version().map_err(|err| err.to_string())?;
+    let mut transition = StateTransition::new(root, version);
+    if !vault_exists {
+        transition.push(StateOperation::CreateAccount {
+            owner_key_id: vault_key,
+        });
+    }
+    transition.push(StateOperation::PaySecurity {
+        fee_pool,
+        fee_debit: fee_balance,
+        vault,
+        vault_debit: vault_balance,
+        mint,
+        payouts,
+    });
+    let next = version.checked_add(1).ok_or("versión de estado agotada")?;
+    let mut batch = StorageBatch::new();
+    state
+        .stage_transition(&mut batch, &transition, next)
+        .map_err(|err| err.to_string())?;
+    batch.put(ColumnFamily::Default, MONETARY_RUNTIME_KEY, &runtime_bytes);
+    store
+        .database()
+        .write(batch)
+        .map_err(|err| err.to_string())?;
+    Ok(())
+}
+
+/// Sella un bloque en las pruebas de laboratorio. El binario público no lo llama.
+#[cfg(test)]
 fn produce_block(
     state: &State,
     store: &RocksDbChainStore,
@@ -923,6 +1244,8 @@ fn produce_block(
         .ok_or("bloque ausente")?;
     let parent_height = parent.header.height.0;
     if parent_height + 1 == engine_height {
+        let when = next_timestamp(parent.header.timestamp);
+        settle_security(state, store, consensus, when.0)?;
         let opening = wallets
             .lock()
             .map_err(|err| err.to_string())?
@@ -960,6 +1283,7 @@ fn produce_block(
     Ok(engine_height)
 }
 
+#[cfg(test)]
 fn seal_pending(state: &State, store: &RocksDbChainStore, pool: &Mempool) -> Result<(), String> {
     if pool.ready_transactions(1).is_empty() {
         seal_empty(state, store)
@@ -968,6 +1292,7 @@ fn seal_pending(state: &State, store: &RocksDbChainStore, pool: &Mempool) -> Res
     }
 }
 
+#[cfg(test)]
 fn seal_empty(state: &State, store: &RocksDbChainStore) -> Result<(), String> {
     let root = state.state_root().map_err(|err| err.to_string())?;
     let version = state.version().map_err(|err| err.to_string())?;
@@ -1040,6 +1365,7 @@ fn next_timestamp(parent: Timestamp) -> Timestamp {
     Timestamp(now.max(parent.0))
 }
 
+#[cfg(test)]
 fn propose_tip(store: &RocksDbChainStore, consensus: &mut ConsensusEngine) -> Result<(), String> {
     let tip = store
         .get_canonical_tip()
@@ -1058,6 +1384,7 @@ fn propose_tip(store: &RocksDbChainStore, consensus: &mut ConsensusEngine) -> Re
     Ok(())
 }
 
+#[cfg(test)]
 fn cast_local_vote(
     store: &RocksDbChainStore,
     consensus: &mut ConsensusEngine,
@@ -1095,6 +1422,7 @@ fn cast_local_vote(
     Ok(vote)
 }
 
+#[cfg(test)]
 fn verify_vote_signature(vote: &Vote) -> Result<(), String> {
     if vote.validator != AccountId::ZERO {
         return Err("invalid signature".into());
@@ -1413,7 +1741,7 @@ fn checked_certificate(
 struct ChainBody {
     state: State,
     store: RocksDbChainStore,
-    consensus: ConsensusEngine,
+    consensus: Option<ConsensusEngine>,
 }
 
 struct NodeRpc {
@@ -1425,6 +1753,8 @@ struct NodeRpc {
     /// Directorio discovery: self + seeds (+ file). Sin API fija obligatoria.
     rpc_endpoints: Vec<RpcEndpoint>,
     names: Arc<names::NameBook>,
+    outbound: Arc<Mutex<Option<NetworkHandle>>>,
+    committee: bool,
 }
 
 #[cfg(test)]
@@ -1435,15 +1765,26 @@ fn rpc_context(
     consensus: ConsensusEngine,
     pool: Arc<Mempool>,
 ) -> RpcContext {
-    shared_chain(config, state, store, consensus, pool).0
+    shared_chain(
+        config,
+        state,
+        store,
+        Some(consensus),
+        pool,
+        Arc::new(Mutex::new(None)),
+        true,
+    )
+    .0
 }
 
 fn shared_chain(
     config: &Config,
     state: State,
     store: RocksDbChainStore,
-    consensus: ConsensusEngine,
+    consensus: Option<ConsensusEngine>,
     pool: Arc<Mempool>,
+    outbound: Arc<Mutex<Option<NetworkHandle>>>,
+    committee: bool,
 ) -> (
     RpcContext,
     Arc<Mutex<ChainBody>>,
@@ -1467,6 +1808,8 @@ fn shared_chain(
         wallets: Arc::clone(&wallets),
         rpc_endpoints,
         names,
+        outbound,
+        committee,
     });
     let context = RpcContext::new(
         Arc::clone(&node) as Arc<dyn NodeService>,
@@ -1486,20 +1829,148 @@ fn shared_chain(
     (context, chain, wallets)
 }
 
+fn default_p2p_listen() -> Result<rsc_p2p::Multiaddr, String> {
+    #[cfg(test)]
+    let raw = "/ip4/127.0.0.1/tcp/0";
+    #[cfg(not(test))]
+    let raw = "/ip4/0.0.0.0/tcp/9000";
+    raw.parse().map_err(|_| "escucha p2p inválida".to_string())
+}
+
 fn p2p_config(config: &Config) -> Result<NetworkConfig, String> {
-    let network = NetworkConfig {
+    let peers = bootstrap_peers(config)?;
+    let mut network = NetworkConfig {
         network_id: config.network_id.clone(),
         chain_id: rsc_core::ChainId(config.chain_id),
-        discovery: DiscoveryConfig::for_network(&config.network_id, Vec::new())
+        listen_addresses: vec![default_p2p_listen()?],
+        bootstrap_peers: peers.clone(),
+        discovery: DiscoveryConfig::for_network(&config.network_id, peers)
             .map_err(|err| err.to_string())?,
         ..NetworkConfig::default()
     };
+    apply_public_relay(&mut network)?;
     network.validate().map_err(|err| err.to_string())?;
     Ok(network)
 }
 
+#[cfg(not(test))]
+fn apply_public_relay(network: &mut NetworkConfig) -> Result<(), String> {
+    if let Ok(relay) = std::env::var("RSC_P2P_RELAY") {
+        let relay = relay.trim();
+        if !relay.is_empty() {
+            let addr: rsc_p2p::Multiaddr = relay
+                .parse()
+                .map_err(|_| "RSC_P2P_RELAY inválida".to_string())?;
+            if rsc_p2p::discovery::peer_id_from_multiaddr(&addr).is_none() {
+                return Err("RSC_P2P_RELAY necesita /p2p/<id>".into());
+            }
+            network.relay_client = Some(addr);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn apply_public_relay(_network: &mut NetworkConfig) -> Result<(), String> {
+    Ok(())
+}
+
+fn known_peer_addrs(config: &Config) -> Vec<String> {
+    peers_of(&config.data_dir, &config.p2p_peers)
+}
+
+fn peers_of(data_dir: &str, extra: &[String]) -> Vec<String> {
+    let mut peers = extra.to_vec();
+    let path = std::path::Path::new(data_dir).join("peers.txt");
+    if let Ok(text) = std::fs::read_to_string(path) {
+        for line in text.lines() {
+            let line = line.trim();
+            if !line.is_empty() && !peers.iter().any(|known| known == line) {
+                peers.push(line.to_string());
+            }
+        }
+    }
+    #[cfg(not(test))]
+    if let Ok(bootstrap) = std::env::var("RSC_P2P_BOOTSTRAP") {
+        for part in bootstrap.split(',') {
+            let part = part.trim();
+            if !part.is_empty() && !peers.iter().any(|known| known == part) {
+                peers.push(part.to_string());
+            }
+        }
+    }
+    peers
+}
+
+fn bootstrap_peers(config: &Config) -> Result<Vec<rsc_p2p::BootstrapPeer>, String> {
+    let mut peers = Vec::new();
+    for raw in known_peer_addrs(config) {
+        let addr: rsc_p2p::Multiaddr = raw.parse().map_err(|_| format!("par inválido {raw}"))?;
+        let peer_id = rsc_p2p::discovery::peer_id_from_multiaddr(&addr)
+            .ok_or_else(|| format!("el par necesita /p2p/<id>: {raw}"))?;
+        peers.push(
+            rsc_p2p::BootstrapPeer::new(peer_id, vec![addr]).map_err(|err| err.to_string())?,
+        );
+    }
+    Ok(peers)
+}
+
+fn remember_peer(data_dir: &str, addr: &rsc_p2p::Multiaddr) {
+    if !matches!(
+        rsc_p2p::presence::classify(addr),
+        rsc_p2p::presence::AddrClass::Global | rsc_p2p::presence::AddrClass::Private
+    ) {
+        return;
+    }
+    let text = addr.to_string();
+    let path = std::path::Path::new(data_dir).join("peers.txt");
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    if existing.lines().any(|line| line.trim() == text) {
+        return;
+    }
+    let mut next = existing;
+    if !next.is_empty() && !next.ends_with('\n') {
+        next.push('\n');
+    }
+    next.push_str(&text);
+    next.push('\n');
+    let _ = std::fs::write(path, next);
+}
+
+fn reachable_listen(addr: &rsc_p2p::Multiaddr, peer: rsc_p2p::PeerId) -> String {
+    let with_peer = if rsc_p2p::discovery::peer_id_from_multiaddr(addr).is_some() {
+        addr.to_string()
+    } else {
+        format!("{addr}/p2p/{peer}")
+    };
+    let lan = local_ipv4().map(|ip| ip.to_string());
+    match lan {
+        Some(ip) if with_peer.contains("/ip4/0.0.0.0/") => {
+            with_peer.replace("/ip4/0.0.0.0/", &format!("/ip4/{ip}/"))
+        }
+        _ => with_peer,
+    }
+}
+
+fn local_ipv4() -> Option<std::net::Ipv4Addr> {
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("8.8.8.8:80").ok()?;
+    match socket.local_addr().ok()?.ip() {
+        std::net::IpAddr::V4(ip) if !ip.is_loopback() => Some(ip),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
 async fn start_p2p(config: NetworkConfig) -> Result<RscNetwork, String> {
     let (_, keypair) = LocalPeerIdentity::generate();
+    start_p2p_with_key(config, keypair).await
+}
+
+async fn start_p2p_with_key(
+    config: NetworkConfig,
+    keypair: rsc_p2p::Keypair,
+) -> Result<RscNetwork, String> {
     let mut network = RscNetwork::start(config, keypair)
         .await
         .map_err(|err| err.to_string())?;
@@ -1508,7 +1979,14 @@ async fn start_p2p(config: NetworkConfig) -> Result<RscNetwork, String> {
     while !listening || !bound {
         match network.next_event().await {
             Some(NetworkEvent::ListeningStarted) => listening = true,
-            Some(NetworkEvent::ListeningAddressAdded(_)) => bound = true,
+            Some(NetworkEvent::ListeningAddressAdded(addr)) => {
+                bound = true;
+                println!(
+                    "nodo en la red {}",
+                    reachable_listen(&addr, network.local_peer_id())
+                );
+                let _ = std::io::Write::flush(&mut std::io::stdout());
+            }
             Some(_) => {}
             None => return Err("p2p cerrado antes de escuchar".into()),
         }
@@ -1519,6 +1997,88 @@ async fn start_p2p(config: NetworkConfig) -> Result<RscNetwork, String> {
 async fn stop_p2p(network: &mut RscNetwork) -> Result<(), String> {
     network.handle().shutdown().map_err(|err| err.to_string())?;
     while network.next_event().await.is_some() {}
+    Ok(())
+}
+
+fn observe_gossip(
+    pool: &Mempool,
+    handle: &NetworkHandle,
+    chain: &Mutex<ChainBody>,
+    committee: bool,
+    topic: GossipTopic,
+    data: &[u8],
+    message_id: Vec<u8>,
+) {
+    match classify_ingress(topic, committee) {
+        Ingress::OfferTransaction => match pool.insert(data.to_vec()) {
+            Ok(_) | Err(MempoolError::AlreadyKnown) => {
+                let _ = handle.report_gossip_validation(message_id, GossipAcceptance::Accept);
+            }
+            Err(err) => {
+                eprintln!("tx rechazada: {err}");
+                let _ = handle.report_gossip_validation(message_id, GossipAcceptance::Reject);
+            }
+        },
+        Ingress::HoldBlock => {
+            match held_block(chain, data) {
+                Ok(()) => {
+                    eprintln!("bloque no persistido: falta autorización verificable")
+                }
+                Err(err) => eprintln!("bloque rechazado: {err}"),
+            }
+            let _ = handle.report_gossip_validation(message_id, GossipAcceptance::Reject);
+        }
+        Ingress::HoldConsensus => {
+            eprintln!("voto no aplicado: el nodo observador no fabrica votos ni pruebas");
+            let _ = handle.report_gossip_validation(message_id, GossipAcceptance::Reject);
+        }
+        Ingress::HoldEvidence => {
+            eprintln!("evidencia no persistida");
+            let _ = handle.report_gossip_validation(message_id, GossipAcceptance::Reject);
+        }
+        Ingress::Reject(reason) => {
+            eprintln!("{reason}");
+            let _ = handle.report_gossip_validation(message_id, GossipAcceptance::Reject);
+        }
+    }
+}
+
+fn held_block(chain: &Mutex<ChainBody>, data: &[u8]) -> Result<(), String> {
+    let block = rsc_chain::decode_block(data).map_err(|err| err.to_string())?;
+    let body = chain.lock().map_err(|err| err.to_string())?;
+    let tip = body
+        .store
+        .get_canonical_tip()
+        .map_err(|err| err.to_string())?
+        .ok_or("falta tip")?;
+    let parent = body
+        .store
+        .get_block(&tip)
+        .map_err(|err| err.to_string())?
+        .ok_or("bloque ausente")?;
+    let limits = load_network_parameters(body.store.database().as_ref())?;
+    rsc_chain::validate_block(
+        &block,
+        &rsc_chain::ChainValidationContext {
+            expected_chain_id: parent.header.chain_id,
+            expected_protocol_version: parent.header.version,
+            max_block_size: limits.max_block_size as usize,
+            max_transactions_per_block: limits.max_transactions_per_block as usize,
+            parent: Some(parent.header.clone()),
+        },
+    )
+    .map_err(|err| err.to_string())?;
+    if let Some(engine) = body.consensus.as_ref() {
+        let authorized = engine
+            .state()
+            .committee
+            .members
+            .iter()
+            .any(|member| member.validator_id == block.header.proposer);
+        if !authorized {
+            return Err("proposer no autorizado".into());
+        }
+    }
     Ok(())
 }
 
@@ -1575,23 +2135,107 @@ async fn process_shutdown() {
     }
 }
 
+fn health_probe(bind: SocketAddr) -> String {
+    format!("http://{}/health", rpc_probe_addr(bind))
+}
+
+fn registry_endpoint(flag: Option<&str>) -> Option<String> {
+    if std::env::var("RSC_REGISTRY_DISABLE").ok().as_deref() == Some("1") {
+        return None;
+    }
+    if let Some(url) = flag {
+        return Some(url.to_string());
+    }
+    if let Ok(url) = std::env::var("RSC_REGISTRY_URL") {
+        if !url.is_empty() {
+            return Some(url);
+        }
+    }
+    Some("http://127.0.0.1:8550".to_string())
+}
+
+fn spawn_node_announcer(
+    identity: &[u8],
+    peer_id: String,
+    network_id: &str,
+    chain_id: u32,
+    registry_flag: Option<&str>,
+    rpc_public_url: Option<String>,
+    probe: String,
+    data_dir: &str,
+) -> Option<rsc_registry::AnnouncerHandle> {
+    let Some(registry_url) = registry_endpoint(registry_flag) else {
+        eprintln!("anuncio desactivado");
+        return None;
+    };
+    if identity.is_empty() {
+        eprintln!("anuncio omitido: identidad");
+        return None;
+    }
+    let config = rsc_registry::AnnouncerConfig {
+        identity_protobuf: identity.to_vec(),
+        peer_id,
+        network_id: network_id.to_string(),
+        chain_id,
+        node_type: rsc_registry::NodeType::Full,
+        registry_url,
+        rpc_public_url,
+        service_url: None,
+        probe_health_url: Some(probe),
+        software_version: "0.1.0".into(),
+        sequence_path: std::path::Path::new(data_dir).join("announce.seq"),
+        heartbeat_secs: 15,
+        ttl_secs: 45,
+        host_allowlist: rsc_registry::validate::host_allowlist_from_env(),
+    };
+    match rsc_registry::spawn_announcer(config) {
+        Ok(handle) => Some(handle),
+        Err(err) => {
+            eprintln!("anuncio: {err}");
+            None
+        }
+    }
+}
+
+fn release_announcer(announcer: &mut Option<rsc_registry::AnnouncerHandle>) {
+    if let Some(handle) = announcer.take() {
+        handle.shutdown();
+    }
+}
+
 fn serve_rpc(
     config: &Config,
     state: State,
     store: RocksDbChainStore,
-    consensus: ConsensusEngine,
+    consensus: Option<ConsensusEngine>,
     pool: Arc<Mempool>,
 ) -> Result<(), String> {
     let p2p = p2p_config(config)?;
+    let peer_addrs = known_peer_addrs(config);
     let rpc_config = RpcConfig {
         bind_address: config.rpc_bind,
         allowed_origins: config.rpc_cors.clone(),
         ..RpcConfig::default()
     };
     let bind = rpc_config.bind_address;
-    let (context, chain, wallets) =
-        shared_chain(config, state, store, consensus, Arc::clone(&pool));
+    let outbound = Arc::new(Mutex::new(None));
+    let committee = consensus.is_some();
+    let (context, chain, _wallets) = shared_chain(
+        config,
+        state,
+        store,
+        consensus,
+        Arc::clone(&pool),
+        Arc::clone(&outbound),
+        committee,
+    );
     let server = RpcServer::new(context, rpc_config);
+    let data_dir = config.data_dir.clone();
+    let registry_flag = config.registry_url.clone();
+    let network_id = config.network_id.clone();
+    let chain_id = config.chain_id;
+    let rpc_public_url = config.rpc_public_url.clone();
+    let extra_peers = config.p2p_peers.clone();
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -1601,13 +2245,37 @@ fn serve_rpc(
                 tokio::spawn(async move { server.run().await.map_err(|err| err.to_string()) });
             wait_rpc(&mut rpc, bind).await?;
             eprintln!("rpc bind {bind} GET /health GET /network GET /swap POST /rpc");
-            let mut network = match start_p2p(p2p).await {
+            let key_path = std::path::Path::new(&data_dir).join("p2p.key");
+            let (_, keypair) = match LocalPeerIdentity::load_or_create(&key_path) {
+                Ok(loaded) => loaded,
+                Err(err) => return Err(format!("{err}: no se sobrescribe")),
+            };
+            let identity_protobuf = std::fs::read(&key_path).unwrap_or_default();
+            let mut network = match start_p2p_with_key(p2p, keypair).await {
                 Ok(network) => network,
                 Err(err) => {
                     rpc.abort();
                     return Err(err);
                 }
             };
+            if let Ok(mut slot) = outbound.lock() {
+                *slot = Some(network.handle().clone());
+            }
+            for peer in peer_addrs {
+                if let Ok(addr) = peer.parse() {
+                    let _ = network.handle().dial(addr);
+                }
+            }
+            let mut announcer = spawn_node_announcer(
+                &identity_protobuf,
+                network.local_peer_id().to_string(),
+                &network_id,
+                chain_id,
+                registry_flag.as_deref(),
+                rpc_public_url,
+                health_probe(bind),
+                &data_dir,
+            );
             let mut tick =
                 tokio::time::interval(std::time::Duration::from_secs(BLOCK_INTERVAL_SECS));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1615,33 +2283,69 @@ fn serve_rpc(
                 tokio::select! {
                     result = &mut rpc => {
                         let rpc_result = join_rpc(result);
+                        release_announcer(&mut announcer);
                         stop_p2p(&mut network).await?;
                         return rpc_result;
                     }
                     _ = process_shutdown() => {
+                        release_announcer(&mut announcer);
                         stop_p2p(&mut network).await?;
                         return join_rpc(rpc.await);
                     }
-                    _ = tick.tick() => {
-                        let outcome = {
-                            let mut body = match chain.lock() {
-                                Ok(body) => body,
-                                Err(err) => return Err(err.to_string()),
-                            };
-                            let ChainBody {
-                                state,
-                                store,
-                                consensus,
-                            } = &mut *body;
-                            produce_block(state, store, &pool, consensus, &wallets)
-                        };
-                        match outcome {
-                            Ok(height) => {
-                                println!("bloque {height}");
+                    event = network.next_event() => {
+                        match event {
+                            Some(NetworkEvent::PeerConnected(peer)) => {
+                                println!("par conectado {peer}");
                                 let _ = std::io::Write::flush(&mut std::io::stdout());
                             }
-                            Err(err) => eprintln!("bloque: {err}"),
+                            Some(NetworkEvent::PeerDisconnected(peer)) => {
+                                println!("par desconectado {peer}");
+                                let _ = std::io::Write::flush(&mut std::io::stdout());
+                                let marker = format!("/p2p/{peer}");
+                                for raw in peers_of(&data_dir, &extra_peers) {
+                                    if raw.contains(&marker) {
+                                        if let Ok(addr) = raw.parse() {
+                                            let _ = network.handle().dial(addr);
+                                        }
+                                    }
+                                }
+                            }
+                            Some(NetworkEvent::Presence(note)) => {
+                                if let Some(handle) = announcer.as_ref() {
+                                    if note == "presence private" || note == "presence unknown" {
+                                        handle.set_p2p_addr(None);
+                                    } else if let Some(addr) = note
+                                        .strip_prefix("presence public ")
+                                        .or_else(|| note.strip_prefix("presence relay "))
+                                    {
+                                        handle.set_p2p_addr(Some(addr.trim().to_string()));
+                                    }
+                                }
+                            }
+                            Some(NetworkEvent::DiscoveryEvent(rsc_p2p::DiscoveryEvent::AddressDiscovered { peer_id, address })) => {
+                                let announced = if rsc_p2p::discovery::peer_id_from_multiaddr(&address).is_some() {
+                                    address
+                                } else {
+                                    format!("{address}/p2p/{peer_id}").parse().unwrap_or(address)
+                                };
+                                remember_peer(&data_dir, &announced);
+                            }
+                            Some(NetworkEvent::GossipMessageReceived { topic, data, message_id, .. }) => {
+                                observe_gossip(&pool, network.handle(), &chain, committee, topic, &data, message_id);
+                            }
+                            Some(_) => {}
+                            None => {
+                                release_announcer(&mut announcer);
+                                return Err("p2p cerrado".into());
+                            }
                         }
+                    }
+                    _ = tick.tick() => {
+                        let body = match chain.lock() {
+                            Ok(body) => body,
+                            Err(err) => return Err(err.to_string()),
+                        };
+                        let _ = refresh_security_roster(&body.store, &data_dir);
                     }
                 }
             }
@@ -2081,12 +2785,18 @@ impl NodeService for NodeRpc {
             Ok(hash) => hash,
             Err(_) => return failed(ServiceError::Internal),
         };
-        let epoch = chain.consensus.state().epoch;
-        let finalized_height = match load_finality(&chain.store, &chain.consensus.state().committee)
-        {
-            Ok(Some(finality)) => finality.finalized_height,
-            Ok(None) => 0,
-            Err(err) => return failed(err),
+        let (epoch, finalized_height) = match chain.consensus.as_ref() {
+            Some(engine) => {
+                let epoch = engine.state().epoch;
+                let finalized_height = match load_finality(&chain.store, &engine.state().committee)
+                {
+                    Ok(Some(finality)) => finality.finalized_height,
+                    Ok(None) => 0,
+                    Err(err) => return failed(err),
+                };
+                (epoch, finalized_height)
+            }
+            None => (0, 0),
         };
         ready(RpcStatus {
             syncing: false,
@@ -2268,9 +2978,16 @@ impl ChainService for NodeRpc {
 impl TransactionService for NodeRpc {
     fn submit_signed(&self, signed_tx: &[u8]) -> ServiceFut<'_, RpcSubmitResult> {
         match self.pool.insert(signed_tx.to_vec()) {
-            Ok(hash) => ready(RpcSubmitResult {
-                transaction_hash: encode_hex(&hash.0 .0),
-            }),
+            Ok(hash) => {
+                if let Ok(slot) = self.outbound.lock() {
+                    if let Some(handle) = slot.as_ref() {
+                        let _ = handle.publish(GossipTopic::Transactions, signed_tx.to_vec());
+                    }
+                }
+                ready(RpcSubmitResult {
+                    transaction_hash: encode_hex(&hash.0 .0),
+                })
+            }
             Err(_) => failed(ServiceError::InvalidTransaction),
         }
     }
@@ -2402,8 +3119,13 @@ impl ConsensusService for NodeRpc {
             Ok(chain) => chain,
             Err(err) => return failed(err),
         };
+        let members = chain
+            .consensus
+            .as_ref()
+            .map(|engine| engine.state().committee.members.clone())
+            .unwrap_or_default();
         let mut validators = Vec::new();
-        for member in &chain.consensus.state().committee.members {
+        for member in &members {
             let Ok(voting_power) = u64::try_from(member.voting_power) else {
                 return failed(ServiceError::Internal);
             };
@@ -2422,7 +3144,10 @@ impl ConsensusService for NodeRpc {
             Ok(chain) => chain,
             Err(err) => return failed(err),
         };
-        match load_finality(&chain.store, &chain.consensus.state().committee) {
+        let Some(engine) = chain.consensus.as_ref() else {
+            return failed(ServiceError::ConsensusUnavailable);
+        };
+        match load_finality(&chain.store, &engine.state().committee) {
             Ok(Some(finality)) => ready(finality),
             Ok(None) => failed(ServiceError::ConsensusUnavailable),
             Err(err) => failed(err),
@@ -2601,6 +3326,8 @@ fn parse_args_with_rpc_env(
     let mut rpc_cors = Vec::new();
     let mut rpc_public_url = None;
     let mut rpc_seeds = Vec::new();
+    let mut p2p_peers = Vec::new();
+    let mut registry_url = None;
     let mut args = args.into_iter();
     while let Some(flag) = args.next() {
         let value = args
@@ -2628,6 +3355,24 @@ fn parse_args_with_rpc_env(
             "--rpc-seed" => {
                 let url = normalize_rpc_url(&value).ok_or("rpc-seed inválida")?;
                 rpc_seeds.push(url);
+            }
+            "--peer" => {
+                if value.is_empty() || !value.contains("/p2p/") {
+                    return Err("el par necesita /p2p/<id>".into());
+                }
+                p2p_peers.push(value);
+            }
+            "--registry-url" => {
+                let url = value.trim().trim_end_matches('/').to_string();
+                let lower = url.to_ascii_lowercase();
+                if url.is_empty()
+                    || url.contains(' ')
+                    || url.contains('@')
+                    || !(lower.starts_with("http://") || lower.starts_with("https://"))
+                {
+                    return Err("registry-url inválida".into());
+                }
+                set(&mut registry_url, url, "registry-url")?;
             }
             "--chain-id" => {
                 if chain_id.is_some() {
@@ -2685,6 +3430,8 @@ fn parse_args_with_rpc_env(
         rpc_cors,
         rpc_public_url,
         rpc_seeds,
+        p2p_peers,
+        registry_url,
     })
 }
 
@@ -2942,6 +3689,8 @@ mod tests {
             rpc_cors: Vec::new(),
             rpc_public_url: None,
             rpc_seeds: Vec::new(),
+            p2p_peers: Vec::new(),
+            registry_url: None,
         }
     }
 
@@ -4210,18 +4959,13 @@ mod tests {
         let (pool, execution, mut consensus) = super::open_services(&store).unwrap();
         reach_new_view(&state, &store, &mut consensus);
         let too_much = signed_to(peer, 0, 501);
-        let rejected = pool.insert(too_much.canonical_bytes()).unwrap();
         assert_eq!(
-            super::prepare_ready(&state, &pool).unwrap_err(),
-            "insufficient balance"
+            pool.insert(too_much.canonical_bytes()),
+            Err(rsc_mempool::MempoolError::ValidationFailed)
         );
-        assert_eq!(
-            pool.queue_state(&rejected),
-            Some(TransactionQueueState::Ready)
-        );
+        assert_eq!(pool.len(), 0);
         assert_eq!(state.state_root().unwrap(), root);
         assert_eq!(state.version().unwrap(), version);
-        pool.remove(&rejected);
 
         let key = rsc_crypto::PrivateKey::from_bytes(&[0x11; 32]).unwrap();
         let signed = signed_to(peer, 0, 7);
@@ -4901,7 +5645,6 @@ mod tests {
     fn the_node_seals_empty_blocks_and_keeps_going() {
         let (_dir, state, store) = opened();
         let version = state.version().unwrap();
-        let root = state.state_root().unwrap();
         let balance = state
             .get_account(&derived_account().into())
             .unwrap()
@@ -4928,10 +5671,11 @@ mod tests {
             .unwrap();
         assert!(block.transactions.is_empty());
         assert_eq!(block.header.height, BlockHeight(1));
-        assert_eq!(block.header.state_root, Hash(*root.as_bytes()));
         assert!(block.header.timestamp.0 >= 1_700_000_000);
-        assert_eq!(state.state_root().unwrap(), root);
-        assert_eq!(state.version().unwrap(), version);
+        let settled_root = state.state_root().unwrap();
+        let settled_version = state.version().unwrap();
+        assert_eq!(settled_version, version);
+        assert_eq!(block.header.state_root, Hash(*settled_root.as_bytes()));
         assert_eq!(
             state
                 .get_account(&derived_account().into())
@@ -4939,6 +5683,19 @@ mod tests {
                 .unwrap()
                 .native_balance(),
             balance
+        );
+        let vault = rsc_state::derive_account_id(&rsc_monetary::security_vault_key_id());
+        assert!(state.get_account(&vault).unwrap().is_none());
+        let runtime = super::load_monetary_runtime(store.database().as_ref()).unwrap();
+        assert!(runtime.security_armed);
+        assert!(runtime.settled_days >= 1);
+        assert_eq!(
+            runtime
+                .supply
+                .remaining_budget(rsc_monetary::EmissionCategory::Mining)
+                .unwrap()
+                .0,
+            rsc_monetary::MINING_BUDGET
         );
         assert_eq!(consensus.state().height, 2);
         assert_eq!(consensus.state().phase, ConsensusPhase::NewView);
@@ -4955,7 +5712,8 @@ mod tests {
             later.header.previous_block_hash,
             block.block_hash().unwrap()
         );
-        assert_eq!(state.state_root().unwrap(), root);
+        assert_eq!(state.state_root().unwrap(), settled_root);
+        assert_eq!(state.version().unwrap(), settled_version);
         assert_eq!(consensus.state().height, 3);
         assert!(pool.is_empty());
         let tip = store.get_canonical_tip().unwrap().unwrap();
@@ -5053,8 +5811,10 @@ mod tests {
             &config_at("unused", "devnet", 3),
             state,
             store,
-            consensus,
+            Some(consensus),
             Arc::clone(&pool),
+            Arc::new(std::sync::Mutex::new(None)),
+            true,
         );
         let created = wait(rsc_rpc::methods::dispatch(
             &ctx,
@@ -5085,7 +5845,14 @@ mod tests {
                 store,
                 consensus,
             } = &mut *body;
-            let height = super::produce_block(state, store, &pool, consensus, &wallets).unwrap();
+            let height = super::produce_block(
+                state,
+                store,
+                &pool,
+                consensus.as_mut().unwrap(),
+                &wallets,
+            )
+            .unwrap();
             assert_eq!(height, 1);
         }
         assert!(wallets.lock().unwrap().is_empty());
@@ -5119,5 +5886,263 @@ mod tests {
             assert_eq!(network.handle().local_peer_id(), peer);
             super::stop_p2p(&mut network).await.unwrap();
         });
+    }
+
+    fn tip_height(store: &super::RocksDbChainStore) -> u64 {
+        let tip = store.get_canonical_tip().unwrap().unwrap();
+        store.get_block(&tip).unwrap().unwrap().header.height.0
+    }
+
+    #[test]
+    fn empty_genesis_does_not_open_a_committee_or_raise_height() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap();
+        let genesis = write_genesis(dir.path(), 3, derived_account());
+        let mut config = config_at(path, "devnet", 3);
+        config.genesis = Some(genesis);
+        let db = Arc::new(open_database(&config).unwrap());
+        let (state, store) = share_database(Arc::clone(&db)).unwrap();
+        super::ensure_tip(&state, &store, &config).unwrap();
+        let engine = super::open_observer(&store, &config).unwrap();
+        assert!(engine.is_none());
+        super::note_local_chain(&store, false).unwrap();
+        assert_eq!(tip_height(&store), 0);
+        assert!(dir.path().exists());
+    }
+
+    #[test]
+    fn prior_height_without_a_committee_is_reported_and_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap();
+        let genesis = write_genesis(dir.path(), 3, derived_account());
+        let mut config = config_at(path, "devnet", 3);
+        config.genesis = Some(genesis);
+        let db = Arc::new(open_database(&config).unwrap());
+        let (state, store) = share_database(Arc::clone(&db)).unwrap();
+        super::ensure_tip(&state, &store, &config).unwrap();
+        let (pool, _execution, mut consensus) = super::open_services(&store).unwrap();
+        super::resume(&state, &store, &pool, &mut consensus).unwrap();
+        super::produce_block(&state, &store, &pool, &mut consensus, &no_wallets()).unwrap();
+        let height = tip_height(&store);
+        assert!(height > 0);
+        assert_eq!(
+            super::extension_warning(height, false),
+            Some(
+                "cadena local por encima del génesis sin comité autorizado; no se extiende ni se borra"
+            )
+        );
+        let tip = store.get_canonical_tip().unwrap();
+        assert!(dir.path().exists());
+        assert_eq!(store.get_canonical_tip().unwrap(), tip);
+    }
+
+    #[test]
+    fn unauthorized_block_does_not_move_the_tip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap();
+        let genesis = write_genesis(dir.path(), 3, derived_account());
+        let mut config = config_at(path, "devnet", 3);
+        config.genesis = Some(genesis);
+        let db = Arc::new(open_database(&config).unwrap());
+        let (state, store) = share_database(Arc::clone(&db)).unwrap();
+        super::ensure_tip(&state, &store, &config).unwrap();
+        let chain = std::sync::Mutex::new(super::ChainBody {
+            state,
+            store,
+            consensus: None,
+        });
+        let before = chain.lock().unwrap().store.get_canonical_tip().unwrap();
+        assert!(super::held_block(&chain, b"not-a-block").is_err());
+        assert_eq!(
+            rsc_p2p::classify_ingress(rsc_p2p::GossipTopic::Blocks, false),
+            rsc_p2p::Ingress::Reject("bloque sin comité")
+        );
+        assert_eq!(
+            chain.lock().unwrap().store.get_canonical_tip().unwrap(),
+            before
+        );
+        assert_eq!(tip_height(&chain.lock().unwrap().store), 0);
+    }
+
+    #[test]
+    fn real_committee_does_not_grant_the_observer_a_vote() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap();
+        let secret = rsc_crypto::PrivateKey::from_bytes(&[0x22; 32]).unwrap();
+        let owner_public_key = secret.public_key();
+        let owner_key_id = owner_public_key.key_id();
+        let validator = rsc_genesis::GenesisValidator {
+            account_id: rsc_core::AccountId::from(rsc_state::derive_account_id(&owner_key_id)),
+            owner_key_id,
+            owner_public_key,
+            voting_power: 1,
+            eligible: true,
+        };
+        let genesis = rsc_genesis::Genesis::new(
+            rsc_genesis::GENESIS_VERSION_V1,
+            rsc_core::ChainId(3),
+            1_700_000_000,
+            fixture_parameters(),
+            vec![rsc_genesis::GenesisAccount {
+                account_id: derived_account(),
+                owner_key_id: rsc_crypto::PrivateKey::from_bytes(&[0x11; 32])
+                    .unwrap()
+                    .public_key()
+                    .key_id(),
+                native_balance: 500,
+                allocation: rsc_genesis::GenesisAllocationCategory::Community,
+            }],
+            vec![validator],
+        );
+        let file = dir.path().join("genesis.json");
+        std::fs::write(&file, serde_json::to_vec(&genesis).unwrap()).unwrap();
+        let mut config = config_at(path, "devnet", 3);
+        config.genesis = Some(file.to_str().unwrap().to_string());
+        let db = Arc::new(open_database(&config).unwrap());
+        let (state, store) = share_database(Arc::clone(&db)).unwrap();
+        super::ensure_tip(&state, &store, &config).unwrap();
+        let engine = super::open_observer(&store, &config).unwrap().unwrap();
+        assert!(engine
+            .state()
+            .committee
+            .members
+            .iter()
+            .all(|member| member.validator_id != rsc_core::AccountId::ZERO));
+        assert_eq!(tip_height(&store), 0);
+    }
+
+    #[test]
+    fn empty_committee_propagates_a_transaction_without_a_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap();
+        let genesis = write_genesis(dir.path(), 3, derived_account());
+        let mut config = config_at(path, "devnet", 3);
+        config.genesis = Some(genesis);
+        let db = Arc::new(open_database(&config).unwrap());
+        let (state, store) = share_database(Arc::clone(&db)).unwrap();
+        super::ensure_tip(&state, &store, &config).unwrap();
+        let (pool, _execution) = super::open_pool(&store).unwrap();
+        let chain = std::sync::Mutex::new(super::ChainBody {
+            state,
+            store,
+            consensus: None,
+        });
+        let network = super::p2p_config(&config).unwrap();
+        wait(async move {
+            let mut left = rsc_p2p::RscNetwork::start(
+                network.clone(),
+                rsc_p2p::Keypair::generate_ed25519(),
+            )
+            .await
+            .unwrap();
+            let mut right = rsc_p2p::RscNetwork::start(
+                network,
+                rsc_p2p::Keypair::generate_ed25519(),
+            )
+            .await
+            .unwrap();
+            let addr = wait_listen(&mut left).await;
+            let _ = wait_listen(&mut right).await;
+            let dial = format!("{addr}/p2p/{}", left.local_peer_id());
+            right.handle().dial(dial.parse().unwrap()).unwrap();
+            wait_match(&mut left, |event| {
+                matches!(event, super::NetworkEvent::HandshakeAccepted(_))
+            })
+            .await;
+            wait_match(&mut right, |event| {
+                matches!(event, super::NetworkEvent::HandshakeAccepted(_))
+            })
+            .await;
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            left.handle()
+                .publish(rsc_p2p::GossipTopic::Transactions, b"tx-bytes".to_vec())
+                .unwrap();
+            let event = wait_match(&mut right, |event| {
+                matches!(
+                    event,
+                    super::NetworkEvent::GossipMessageReceived {
+                        topic: rsc_p2p::GossipTopic::Transactions,
+                        ..
+                    }
+                )
+            })
+            .await;
+            if let super::NetworkEvent::GossipMessageReceived {
+                topic,
+                data,
+                message_id,
+                ..
+            } = event
+            {
+                super::observe_gossip(
+                    &pool,
+                    right.handle(),
+                    &chain,
+                    false,
+                    topic,
+                    &data,
+                    message_id,
+                );
+            }
+            left.handle()
+                .publish(rsc_p2p::GossipTopic::Blocks, b"block-bytes".to_vec())
+                .unwrap();
+            let event = wait_match(&mut right, |event| {
+                matches!(
+                    event,
+                    super::NetworkEvent::GossipMessageReceived {
+                        topic: rsc_p2p::GossipTopic::Blocks,
+                        ..
+                    }
+                )
+            })
+            .await;
+            if let super::NetworkEvent::GossipMessageReceived {
+                topic,
+                data,
+                message_id,
+                ..
+            } = event
+            {
+                super::observe_gossip(
+                    &pool,
+                    right.handle(),
+                    &chain,
+                    false,
+                    topic,
+                    &data,
+                    message_id,
+                );
+            }
+            assert_eq!(tip_height(&chain.lock().unwrap().store), 0);
+            left.handle().shutdown().unwrap();
+            right.handle().shutdown().unwrap();
+        });
+    }
+
+    async fn wait_listen(network: &mut rsc_p2p::RscNetwork) -> rsc_p2p::Multiaddr {
+        loop {
+            match network.next_event().await {
+                Some(super::NetworkEvent::ListeningAddressAdded(addr)) => return addr,
+                Some(_) => {}
+                None => panic!("p2p cerrado"),
+            }
+        }
+    }
+
+    async fn wait_match(
+        network: &mut rsc_p2p::RscNetwork,
+        pred: impl Fn(&super::NetworkEvent) -> bool,
+    ) -> super::NetworkEvent {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            let event = tokio::time::timeout_at(deadline, network.next_event())
+                .await
+                .expect("tiempo de red")
+                .expect("p2p cerrado");
+            if pred(&event) {
+                return event;
+            }
+        }
     }
 }

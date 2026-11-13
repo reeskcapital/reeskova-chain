@@ -151,6 +151,25 @@ pub enum StateOperation {
         /// Nonce que debe coincidir con el del emisor.
         expected_nonce: u64,
     },
+    /// Acredita el premio de seguridad del día.
+    ///
+    /// `mint` es emisión nueva. `fee_debit` sale del fee pool. `vault_debit`
+    /// sale de la bóveda. La suma de `payouts` no puede pasar de esas tres
+    /// entradas. Lo que sobra vuelve a la bóveda.
+    PaySecurity {
+        /// Reserva de comisiones. Debe existir si `fee_debit` es positivo.
+        fee_pool: AccountId,
+        /// Comisión de protocolo que sale del pool en este día.
+        fee_debit: u128,
+        /// Bóveda de seguridad. Debe existir.
+        vault: AccountId,
+        /// Saldo que la bóveda aporta al premio de este día.
+        vault_debit: u128,
+        /// Subsidio de minería recién emitido.
+        mint: u128,
+        /// Cuentas que cobran. Cada monto es estrictamente positivo.
+        payouts: Vec<(AccountId, u128)>,
+    },
 }
 
 /// Conjunto ordenado de operaciones contra una raíz y una versión conocidas.
@@ -702,6 +721,74 @@ fn apply_operation(
             // burn_fee (si > 0) ya salió del emisor sin receptor.
             Ok(root)
         }
+        StateOperation::PaySecurity {
+            fee_pool,
+            fee_debit,
+            vault,
+            vault_debit,
+            mint,
+            payouts,
+        } => {
+            let incoming = fee_debit
+                .checked_add(*vault_debit)
+                .and_then(|sum| sum.checked_add(*mint))
+                .ok_or(StateError::BalanceOverflow)?;
+            let mut paid = 0u128;
+            for (_, amount) in payouts {
+                if *amount == 0 {
+                    return Err(StateError::InvalidAmount);
+                }
+                paid = paid.checked_add(*amount).ok_or(StateError::BalanceOverflow)?;
+            }
+            if paid > incoming {
+                return Err(StateError::InsufficientBalance);
+            }
+            let mut root = StateRoot::empty().to_bytes();
+            if *fee_debit > 0 {
+                let pool =
+                    read_account(db, accounts, fee_pool)?.ok_or(StateError::AccountNotFound)?;
+                let pool_balance = pool
+                    .native_balance()
+                    .checked_sub(*fee_debit)
+                    .ok_or(StateError::InsufficientBalance)?;
+                let pool = pool.with_balance_and_nonce(pool_balance, pool.nonce());
+                pool.validate()?;
+                root = write_account_leaf(db, nodes, &pool)?;
+                accounts.insert(*fee_pool, pool);
+            }
+            let vault_account =
+                read_account(db, accounts, vault)?.ok_or(StateError::AccountNotFound)?;
+            if vault_account.native_balance() < *vault_debit {
+                return Err(StateError::InsufficientBalance);
+            }
+            let leftover = incoming - paid;
+            let vault_balance = vault_account
+                .native_balance()
+                .checked_sub(*vault_debit)
+                .and_then(|balance| balance.checked_add(leftover))
+                .ok_or(StateError::BalanceOverflow)?;
+            let vault_account =
+                vault_account.with_balance_and_nonce(vault_balance, vault_account.nonce());
+            vault_account.validate()?;
+            root = write_account_leaf(db, nodes, &vault_account)?;
+            accounts.insert(*vault, vault_account);
+            for (account, amount) in payouts {
+                if account == vault || account == fee_pool {
+                    return Err(StateError::InvalidTransfer);
+                }
+                let current =
+                    read_account(db, accounts, account)?.ok_or(StateError::AccountNotFound)?;
+                let balance = current
+                    .native_balance()
+                    .checked_add(*amount)
+                    .ok_or(StateError::BalanceOverflow)?;
+                let current = current.with_balance_and_nonce(balance, current.nonce());
+                current.validate()?;
+            root = write_account_leaf(db, nodes, &current)?;
+            accounts.insert(*account, current);
+        }
+            Ok(root)
+        }
     }
 }
 
@@ -749,6 +836,31 @@ fn validate_operation_shape(operation: &StateOperation) -> Result<(), StateError
                 .ok_or(StateError::BalanceOverflow)?;
             if fee_total > 0 && (fee_pool == from || fee_pool == to) {
                 return Err(StateError::InvalidTransfer);
+            }
+            Ok(())
+        }
+        StateOperation::PaySecurity {
+            fee_debit,
+            vault_debit,
+            mint,
+            payouts,
+            vault,
+            fee_pool,
+        } => {
+            let incoming = fee_debit
+                .checked_add(*vault_debit)
+                .and_then(|sum| sum.checked_add(*mint))
+                .ok_or(StateError::BalanceOverflow)?;
+            if incoming == 0 {
+                return Err(StateError::InvalidAmount);
+            }
+            if vault == fee_pool {
+                return Err(StateError::InvalidTransfer);
+            }
+            for (account, amount) in payouts {
+                if *amount == 0 || account == vault || account == fee_pool {
+                    return Err(StateError::InvalidAmount);
+                }
             }
             Ok(())
         }
@@ -1354,6 +1466,56 @@ mod tests {
                 .unwrap()
                 .native_balance(),
             71
+        );
+    }
+
+    #[test]
+    fn pay_security_mints_and_leaves_the_remainder_in_the_vault() {
+        let env = open_env();
+        genesis(
+            &env.state,
+            &[
+                GenesisAccount::new(owner(1), 70),
+                GenesisAccount::new(owner(2), 0),
+                GenesisAccount::new(owner(3), 10),
+            ],
+            1,
+        );
+        let pool = derive_account_id(&owner(1));
+        let vault = derive_account_id(&owner(2));
+        let miner = derive_account_id(&owner(3));
+        apply(
+            &env.state,
+            vec![StateOperation::PaySecurity {
+                fee_pool: pool,
+                fee_debit: 70,
+                vault,
+                vault_debit: 0,
+                mint: 30,
+                payouts: vec![(miner, 80)],
+            }],
+            2,
+        )
+        .unwrap();
+        assert_eq!(
+            env.state.get_account(&pool).unwrap().unwrap().native_balance(),
+            0
+        );
+        assert_eq!(
+            env.state
+                .get_account(&miner)
+                .unwrap()
+                .unwrap()
+                .native_balance(),
+            90
+        );
+        assert_eq!(
+            env.state
+                .get_account(&vault)
+                .unwrap()
+                .unwrap()
+                .native_balance(),
+            20
         );
     }
 

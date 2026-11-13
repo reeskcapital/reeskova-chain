@@ -9,9 +9,8 @@
 //! 6. [`treasury`] — Treasury Engine
 //! 7. [`transparency`] — Dashboard de transparencia
 //!
-//! Esta crate define reglas y contabilidad. **No activa** por sí sola la
-//! emisión en el ledger de la red: el cableado a `rsc-state` / génesis debe
-//! verificar el supply ya existente antes de desplegar presupuestos.
+//! El nodo liquida el subsidio de minería y el 70% de las comisiones en la
+//! bóveda de seguridad, y de ahí lo acredita a las personas que cobraron.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
@@ -21,6 +20,8 @@ mod burn;
 mod error;
 mod policy;
 mod rewards;
+mod schedule;
+mod security;
 mod settlement;
 mod staking;
 mod supply;
@@ -36,9 +37,15 @@ pub use policy::{
     PROTOCOL_FEE_BURN_BPS, PROTOCOL_FEE_VALIDATOR_BPS, TREASURY_BUDGET, VALIDATOR_BUDGET,
 };
 pub use rewards::{RewardBalances, ValidatorRewards};
+pub use schedule::{
+    chain_day, daily_subsidy, personal_daily_subsidy, subsidy_for_days, NETWORK_DAILY_CAP,
+    PERSONAL_DAILY_CAP, SECURITY_DAY_SECS,
+};
+pub use security::{payee_accounts, split_security_pot, SecuritySeat};
 pub use settlement::{
     protocol_fee_pool_key_id, protocol_fee_pool_private_key, protocol_fee_pool_seed,
-    MonetaryRuntime, ProtocolFeePlan,
+    security_vault_key_id, security_vault_private_key, security_vault_seed, MonetaryRuntime,
+    ProtocolFeePlan,
 };
 pub use staking::{StakePosition, StakingEngine, StakingParams, ValidatorId};
 pub use supply::{SupplySnapshot, SupplyTracker};

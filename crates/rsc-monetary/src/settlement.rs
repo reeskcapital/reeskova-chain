@@ -8,12 +8,14 @@ use crate::amount_ext::add;
 use crate::burn::{BurnEngine, ProtocolFeeSplit};
 use crate::error::MonetaryError;
 use crate::policy::{EmissionCategory, MonetaryPolicy};
+use crate::schedule::{self, u128_decimal};
 use crate::supply::SupplyTracker;
 use rsc_core::Amount;
 use rsc_crypto::{hash, KeyId, PrivateKey};
 use serde::{Deserialize, Serialize};
 
 const FEE_POOL_SEED_DOMAIN: &[u8] = b"RSC-MONETARY-FEE-POOL/V1\0";
+const SECURITY_VAULT_SEED_DOMAIN: &[u8] = b"RSC-MONETARY-SECURITY-VAULT/V1\0";
 
 /// Plan de comisión listo para una transición de estado.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -45,6 +47,18 @@ pub struct MonetaryRuntime {
     pub supply: SupplyTracker,
     /// Motor de quema.
     pub burn: BurnEngine,
+    /// El calendario de seguridad ya tomó la reserva de minería que quedaba.
+    #[serde(default)]
+    pub security_armed: bool,
+    /// Timestamp del bloque génesis. Cero hasta armar el calendario.
+    #[serde(default)]
+    pub genesis_timestamp: u64,
+    /// Días de cadena ya liquidados. El siguiente día pendiente es este índice.
+    #[serde(default)]
+    pub settled_days: u64,
+    /// Reserva de minería al armar, en unidades mínimas. Texto decimal en JSON.
+    #[serde(default, with = "u128_decimal")]
+    pub mining_unissued_at_arm: u128,
 }
 
 impl MonetaryRuntime {
@@ -55,7 +69,67 @@ impl MonetaryRuntime {
             policy: MonetaryPolicy::v1(),
             supply: SupplyTracker::new(),
             burn: BurnEngine::new(),
+            security_armed: false,
+            genesis_timestamp: 0,
+            settled_days: 0,
+            mining_unissued_at_arm: 0,
         }
+    }
+
+    /// Fija el calendario con la reserva de minería que todavía no se emitió.
+    ///
+    /// Una segunda llamada no cambia la reserva ya armada.
+    pub fn arm_security(&mut self, genesis_timestamp: u64) -> Result<(), MonetaryError> {
+        if genesis_timestamp == 0 || self.security_armed {
+            return Ok(());
+        }
+        self.mining_unissued_at_arm = self.supply.remaining_budget(EmissionCategory::Mining)?.0;
+        self.genesis_timestamp = genesis_timestamp;
+        self.settled_days = 0;
+        self.security_armed = true;
+        Ok(())
+    }
+
+    /// Subsidio de minería de los días ya cumplidos y todavía no liquidados.
+    ///
+    /// `block_timestamp` es el timestamp del bloque que se está sellando.
+    /// `payees` es la gente que cobra hoy. Con cero personas no se emite.
+    /// Cada día atrasado usa ese mismo recuento.
+    pub fn subsidy_due(&self, block_timestamp: u64, payees: u64) -> u128 {
+        if !self.security_armed || self.genesis_timestamp == 0 || payees == 0 {
+            return 0;
+        }
+        let day = schedule::chain_day(self.genesis_timestamp, block_timestamp);
+        if day <= self.settled_days {
+            return 0;
+        }
+        let elapsed = day - self.settled_days;
+        let remaining = self
+            .supply
+            .remaining_budget(EmissionCategory::Mining)
+            .map(|amount| amount.0)
+            .unwrap_or(0);
+        schedule::subsidy_for_days(remaining, payees, elapsed)
+    }
+
+    /// Día de cadena que cubre `block_timestamp`, si el calendario está armado.
+    pub fn open_day(&self, block_timestamp: u64) -> Option<u64> {
+        if !self.security_armed || self.genesis_timestamp == 0 {
+            return None;
+        }
+        Some(schedule::chain_day(self.genesis_timestamp, block_timestamp))
+    }
+
+    /// Marca liquidados los días hasta `day` y emite el subsidio a circulación.
+    pub fn note_security_subsidy(&mut self, day: u64, minted: u128) -> Result<(), MonetaryError> {
+        if minted > 0 {
+            self.supply
+                .emit_circulating(EmissionCategory::Mining, Amount(minted))?;
+        }
+        if day > self.settled_days {
+            self.settled_days = day;
+        }
+        Ok(())
     }
 
     /// Registra balances de génesis ya puestos en circulación bajo una categoría.
@@ -164,6 +238,21 @@ pub fn protocol_fee_pool_private_key() -> PrivateKey {
 /// `KeyId` del fee pool. El `AccountId` se obtiene con `derive_account_id`.
 pub fn protocol_fee_pool_key_id() -> KeyId {
     protocol_fee_pool_private_key().key_id()
+}
+
+/// Semilla de la bóveda que guarda el premio de seguridad hasta cobrarlo.
+pub fn security_vault_seed() -> [u8; 32] {
+    *hash(SECURITY_VAULT_SEED_DOMAIN).as_bytes()
+}
+
+/// Clave determinista de la bóveda de seguridad. No es una clave de usuario.
+pub fn security_vault_private_key() -> PrivateKey {
+    PrivateKey::from_bytes(&security_vault_seed()).expect("seed de 32 bytes")
+}
+
+/// `KeyId` de la bóveda. El saldo que no entra en un asiento se queda aquí.
+pub fn security_vault_key_id() -> KeyId {
+    security_vault_private_key().key_id()
 }
 
 #[cfg(test)]

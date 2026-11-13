@@ -8,17 +8,24 @@
 #![forbid(unsafe_code)]
 
 pub mod discovery;
+pub mod ingress;
 pub mod network;
 pub mod peer;
 pub mod presence;
+pub mod sync;
 
 pub use discovery::{BootstrapPeer, DiscoveryConfig, DiscoveryEvent, DiscoveryManager};
+pub use ingress::{classify_ingress, Ingress};
 pub use network::{
     GossipAcceptance, GossipTopic, NetworkCommand, NetworkConfig, NetworkEvent, NetworkHandle,
     NetworkTimeouts, RscNetwork, RscRequest, RscRequestId, RscResponse,
 };
-pub use peer::{BanReason, LocalPeerIdentity, PeerInfo, PeerPolicy, PeerRegistry, PeerState};
+pub use peer::{
+    BanReason, IdentityError, LocalPeerIdentity, PeerInfo, PeerPolicy, PeerRegistry, PeerState,
+};
+pub use sync::{apply_in_order, range_len};
 
+pub use libp2p::identity::Keypair;
 pub use libp2p::{Multiaddr, PeerId};
 pub use rsc_core::ChainId;
 

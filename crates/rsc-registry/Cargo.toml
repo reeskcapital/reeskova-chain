@@ -1,0 +1,40 @@
+[package]
+name = "rsc-registry"
+version = "0.1.0"
+edition = "2021"
+authors = ["RSC Chain Team", "Steeve"]
+description = "Registro de presencia, anunciador de nodos y gateway RPC de RSC Chain"
+license = "MIT"
+publish = false
+
+[features]
+default = ["server"]
+## Servidor del registro y gateway HTTP. Los binarios de nodo no lo necesitan.
+server = ["dep:axum", "dep:rusqlite", "dep:tower-http"]
+
+[dependencies]
+libp2p = { version = "=0.57.0", default-features = false, features = ["ed25519"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.151"
+thiserror = "1.0.69"
+tokio = { version = "1.53.1", features = ["macros", "rt", "rt-multi-thread", "time", "sync", "net", "signal"] }
+axum = { version = "0.8.9", features = ["json"], optional = true }
+rusqlite = { version = "0.32", features = ["bundled"], optional = true }
+tower-http = { version = "0.6.11", features = ["limit", "timeout"], optional = true }
+
+[dev-dependencies]
+http-body-util = "0.1"
+tempfile = "3"
+tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "time", "net"] }
+tower = { version = "0.5", features = ["util"] }
+
+[[bin]]
+name = "rsc-registry"
+path = "src/bin/rsc-registry.rs"
+required-features = ["server"]
+
+[[bin]]
+name = "rsc-gateway"
+path = "src/bin/rsc-gateway.rs"
+required-features = ["server"]

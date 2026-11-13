@@ -15,17 +15,38 @@ use rsc_rpc::encode_hex;
 
 struct Peer {
     child: Option<Child>,
+    stdin: Option<std::process::ChildStdin>,
     lines: Arc<Mutex<Vec<String>>>,
+    stderr_lines: Arc<Mutex<Vec<String>>>,
     data_dir: PathBuf,
 }
 
 impl Drop for Peer {
     fn drop(&mut self) {
-        if let Some(mut child) = self.child.take() {
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        eprintln!("fase drop-inicio pid={}", child.id());
+        drop(self.stdin.take());
+        #[cfg(unix)]
+        {
             let _ = Command::new("kill")
                 .args(["-TERM", &child.id().to_string()])
                 .status();
-            let _ = child.wait();
+        }
+        let started = Instant::now();
+        loop {
+            if child.try_wait().ok().flatten().is_some() {
+                eprintln!("fase drop-fin pid={}", child.id());
+                return;
+            }
+            if started.elapsed() > Duration::from_secs(5) {
+                eprintln!("fase drop-kill pid={}", child.id());
+                let _ = child.kill();
+                let _ = child.wait();
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
         }
     }
 }
@@ -138,13 +159,18 @@ fn launch(
         args.push("--consensus".into());
         args.push(role.to_string());
     }
+    eprintln!("fase spawn-inicio {network} chain={chain}");
     let mut child = Command::new(bin())
         .args(&args)
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
+    eprintln!("fase spawn-fin pid={}", child.id());
+    let stdin = child.stdin.take();
     let stdout = child.stdout.take().unwrap();
+    let stderr = child.stderr.take().unwrap();
     let lines = Arc::new(Mutex::new(Vec::new()));
     let sink = Arc::clone(&lines);
     std::thread::spawn(move || {
@@ -153,15 +179,29 @@ fn launch(
             sink.lock().unwrap().push(line);
         }
     });
+    let stderr_lines = Arc::new(Mutex::new(Vec::new()));
+    let err_sink = Arc::clone(&stderr_lines);
+    std::thread::spawn(move || {
+        for line in BufReader::new(stderr).lines() {
+            let Ok(line) = line else { break };
+            err_sink.lock().unwrap().push(line);
+        }
+    });
     Peer {
         child: Some(child),
+        stdin,
         lines,
+        stderr_lines,
         data_dir: data,
     }
 }
 
 fn lines_of(peer: &Peer) -> Vec<String> {
     peer.lines.lock().unwrap().clone()
+}
+
+fn stderr_of(peer: &Peer) -> Vec<String> {
+    peer.stderr_lines.lock().unwrap().clone()
 }
 
 fn wait_prefix(peer: &mut Peer, prefix: &str) -> String {
@@ -177,7 +217,11 @@ fn wait_prefix(peer: &mut Peer, prefix: &str) -> String {
             panic!("el proceso salió {status} antes de {prefix}");
         }
         if started.elapsed() > Duration::from_secs(20) {
-            panic!("no apareció {prefix}: {:?}", lines_of(peer));
+            panic!(
+                "no apareció {prefix}: stdout={:?} stderr={:?}",
+                lines_of(peer),
+                stderr_of(peer)
+            );
         }
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -193,22 +237,34 @@ fn peer_of(line: &str) -> PeerId {
 
 fn stop(peer: &mut Peer) {
     let mut child = peer.child.take().unwrap();
-    assert!(child_pids(child.id()).is_empty());
-    let _ = Command::new("kill")
-        .args(["-TERM", &child.id().to_string()])
-        .status();
+    eprintln!("fase stop-inicio pid={}", child.id());
+    drop(peer.stdin.take());
+    #[cfg(unix)]
+    {
+        assert!(child_pids(child.id()).is_empty());
+        let _ = Command::new("kill")
+            .args(["-TERM", &child.id().to_string()])
+            .status();
+    }
     let started = Instant::now();
     loop {
         if let Some(status) = child.try_wait().unwrap() {
-            assert!(status.success(), "{status}");
+            eprintln!("fase stop-fin pid={} status={status}", child.id());
+            assert!(status.success(), "{status} stderr={:?}", stderr_of(peer));
             assert!(std::fs::read_dir(&peer.data_dir).unwrap().next().is_none());
             assert!(!peer.data_dir.join("LOCK").exists());
             std::fs::remove_dir(&peer.data_dir).unwrap();
             return;
         }
         if started.elapsed() > Duration::from_secs(10) {
+            eprintln!("fase stop-timeout pid={}", child.id());
             let _ = child.kill();
-            panic!("el proceso no cerró con TERM");
+            let _ = child.wait();
+            panic!(
+                "el proceso no cerró: stdout={:?} stderr={:?}",
+                lines_of(peer),
+                stderr_of(peer)
+            );
         }
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -233,6 +289,7 @@ fn child_pids(pid: u32) -> Vec<u32> {
 }
 
 fn wait_rejection(first: &mut Peer, second: &mut Peer, message: &str) {
+    eprintln!("fase rechazo-inicio {message}");
     let started = Instant::now();
     loop {
         let left = lines_of(first);
@@ -250,17 +307,25 @@ fn wait_rejection(first: &mut Peer, second: &mut Peer, message: &str) {
                 !right.iter().any(|line| line.starts_with("handshake ")),
                 "{right:?}"
             );
+            eprintln!("fase rechazo-fin {message}");
             return;
         }
         if started.elapsed() > Duration::from_secs(20) {
-            panic!("no apareció rejected {message}: {left:?} {right:?}");
+            panic!(
+                "no apareció rejected {message}: stdout={left:?} {right:?} stderr={:?} {:?}",
+                stderr_of(first),
+                stderr_of(second)
+            );
         }
         std::thread::sleep(Duration::from_millis(20));
     }
 }
 
 fn listen_of(peer: &mut Peer) -> String {
-    wait_prefix(peer, "listen ")
+    eprintln!("fase listen-inicio");
+    let line = wait_prefix(peer, "listen ");
+    eprintln!("fase listen-fin {line}");
+    line
         .split_once(' ')
         .unwrap()
         .1
@@ -1122,10 +1187,15 @@ fn spawn_produce(data: PathBuf, bootstrap: Option<&str>, rpc: &str, role: &str) 
 
 fn stop_keep(peer: &mut Peer) {
     let mut child = peer.child.take().unwrap();
-    assert!(child_pids(child.id()).is_empty());
-    let _ = Command::new("kill")
-        .args(["-TERM", &child.id().to_string()])
-        .status();
+    eprintln!("fase stop-keep-inicio pid={}", child.id());
+    drop(peer.stdin.take());
+    #[cfg(unix)]
+    {
+        assert!(child_pids(child.id()).is_empty());
+        let _ = Command::new("kill")
+            .args(["-TERM", &child.id().to_string()])
+            .status();
+    }
     let started = Instant::now();
     loop {
         if let Some(status) = child.try_wait().unwrap() {
@@ -1183,10 +1253,15 @@ fn expect_db_reject(data: &std::path::Path, network: &str, chain: &str, needle: 
 
 fn stop_chain(peer: &mut Peer) {
     let mut child = peer.child.take().unwrap();
-    assert!(child_pids(child.id()).is_empty());
-    let _ = Command::new("kill")
-        .args(["-TERM", &child.id().to_string()])
-        .status();
+    eprintln!("fase stop-chain-inicio pid={}", child.id());
+    drop(peer.stdin.take());
+    #[cfg(unix)]
+    {
+        assert!(child_pids(child.id()).is_empty());
+        let _ = Command::new("kill")
+            .args(["-TERM", &child.id().to_string()])
+            .status();
+    }
     let started = Instant::now();
     loop {
         if let Some(status) = child.try_wait().unwrap() {
@@ -2015,7 +2090,7 @@ fn start_role(prefix: &str, dirs: &[PathBuf; 4], rpc: &[String; 4]) -> [Peer; 4]
     nodes
 }
 
-fn expect_process_reject(args: &[&str], needle: &str) {
+fn expect_process_reject(args: &[&str], needles: &[&str]) {
     let mut child = Command::new(bin())
         .args(args)
         .stdout(Stdio::null())
@@ -2028,12 +2103,15 @@ fn expect_process_reject(args: &[&str], needle: &str) {
             assert!(!status.success(), "{status}");
             let mut err = String::new();
             child.stderr.take().unwrap().read_to_string(&mut err).unwrap();
-            assert!(err.contains(needle), "{err}");
+            assert!(
+                needles.iter().any(|needle| err.contains(needle)),
+                "{err}"
+            );
             return;
         }
         if started.elapsed() > Duration::from_secs(15) {
             let _ = child.kill();
-            panic!("el proceso no rechazó {needle}");
+            panic!("el proceso no rechazó {needles:?}");
         }
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -2289,7 +2367,7 @@ fn devnet_rejects_mismatched_identity_and_busy_ports() {
             "--consensus",
             "foreign",
         ],
-        "invalid signature",
+        &["invalid signature"],
     );
     let (hold_rpc, rpc_port) = {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -2311,7 +2389,7 @@ fn devnet_rejects_mismatched_identity_and_busy_ports() {
             "--consensus",
             "devnet-0",
         ],
-        "Address already in use",
+        &["Address already in use", "os error 10048"],
     );
     drop(hold_rpc);
     let (hold_p2p, p2p_port) = {
@@ -2337,7 +2415,7 @@ fn devnet_rejects_mismatched_identity_and_busy_ports() {
             "--consensus",
             "devnet-0",
         ],
-        "listen failed",
+        &["listen failed"],
     );
     drop(hold_p2p);
     std::fs::remove_dir_all(&dir).unwrap();
@@ -2963,7 +3041,6 @@ fn devnet_long_run_stays_converged() {
 
 #[test]
 fn persist_peer_id_survives_restart() {
-    use std::os::unix::fs::PermissionsExt;
     let dir = data_dir("peer-keep");
     let key = dir.join("p2p.key");
     std::fs::create_dir_all(&dir).unwrap();
@@ -2971,8 +3048,12 @@ fn persist_peer_id_survives_restart() {
     let peer = wait_prefix(&mut first, "peer ");
     let listen = wait_prefix(&mut first, "listen ");
     assert!(listen.contains(peer.split_whitespace().nth(1).unwrap()), "{listen}");
-    let mode = std::fs::metadata(&key).unwrap().permissions().mode();
-    assert_eq!(mode & 0o077, 0, "{mode:o}");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&key).unwrap().permissions().mode();
+        assert_eq!(mode & 0o077, 0, "{mode:o}");
+    }
     term_files(&mut first);
     let mut second = spawn_persisted(&dir, &key);
     let again = wait_prefix(&mut second, "peer ");
@@ -3031,11 +3112,14 @@ fn spawn_persisted(dir: &std::path::Path, key: &std::path::Path) -> Peer {
             "--persist-peer",
             key.to_str().unwrap(),
         ])
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
+    let stdin = child.stdin.take();
     let stdout = child.stdout.take().unwrap();
+    let stderr = child.stderr.take().unwrap();
     let lines = Arc::new(Mutex::new(Vec::new()));
     let sink = Arc::clone(&lines);
     std::thread::spawn(move || {
@@ -3044,9 +3128,19 @@ fn spawn_persisted(dir: &std::path::Path, key: &std::path::Path) -> Peer {
             sink.lock().unwrap().push(line);
         }
     });
+    let stderr_lines = Arc::new(Mutex::new(Vec::new()));
+    let err_sink = Arc::clone(&stderr_lines);
+    std::thread::spawn(move || {
+        for line in BufReader::new(stderr).lines() {
+            let Ok(line) = line else { break };
+            err_sink.lock().unwrap().push(line);
+        }
+    });
     Peer {
         child: Some(child),
+        stdin,
         lines,
+        stderr_lines,
         data_dir: dir.to_path_buf(),
     }
 }
@@ -3107,11 +3201,14 @@ fn spawn_presence(dir: &std::path::Path) -> Peer {
             "--presence",
             "auto",
         ])
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
+    let stdin = child.stdin.take();
     let stdout = child.stdout.take().unwrap();
+    let stderr = child.stderr.take().unwrap();
     let lines = Arc::new(Mutex::new(Vec::new()));
     let sink = Arc::clone(&lines);
     std::thread::spawn(move || {
@@ -3120,9 +3217,19 @@ fn spawn_presence(dir: &std::path::Path) -> Peer {
             sink.lock().unwrap().push(line);
         }
     });
+    let stderr_lines = Arc::new(Mutex::new(Vec::new()));
+    let err_sink = Arc::clone(&stderr_lines);
+    std::thread::spawn(move || {
+        for line in BufReader::new(stderr).lines() {
+            let Ok(line) = line else { break };
+            err_sink.lock().unwrap().push(line);
+        }
+    });
     Peer {
         child: Some(child),
+        stdin,
         lines,
+        stderr_lines,
         data_dir: dir.to_path_buf(),
     }
 }
@@ -3191,11 +3298,14 @@ fn spawn_relay(
     args.extend(extra.iter().map(|part| (*part).to_string()));
     let mut child = Command::new(bin())
         .args(&args)
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
+    let stdin = child.stdin.take();
     let stdout = child.stdout.take().unwrap();
+    let stderr = child.stderr.take().unwrap();
     let lines = Arc::new(Mutex::new(Vec::new()));
     let sink = Arc::clone(&lines);
     std::thread::spawn(move || {
@@ -3204,9 +3314,19 @@ fn spawn_relay(
             sink.lock().unwrap().push(line);
         }
     });
+    let stderr_lines = Arc::new(Mutex::new(Vec::new()));
+    let err_sink = Arc::clone(&stderr_lines);
+    std::thread::spawn(move || {
+        for line in BufReader::new(stderr).lines() {
+            let Ok(line) = line else { break };
+            err_sink.lock().unwrap().push(line);
+        }
+    });
     Peer {
         child: Some(child),
+        stdin,
         lines,
+        stderr_lines,
         data_dir: dir.to_path_buf(),
     }
 }
@@ -3493,10 +3613,15 @@ fn relay_loss_does_not_become_direct() {
 
 fn term_files(peer: &mut Peer) {
     let mut child = peer.child.take().unwrap();
-    assert!(child_pids(child.id()).is_empty());
-    let _ = Command::new("kill")
-        .args(["-TERM", &child.id().to_string()])
-        .status();
+    eprintln!("fase term-inicio pid={}", child.id());
+    drop(peer.stdin.take());
+    #[cfg(unix)]
+    {
+        assert!(child_pids(child.id()).is_empty());
+        let _ = Command::new("kill")
+            .args(["-TERM", &child.id().to_string()])
+            .status();
+    }
     let started = Instant::now();
     loop {
         if let Some(status) = child.try_wait().unwrap() {

@@ -105,6 +105,8 @@ struct Duty {
     audit: bool,
     sync_started: AtomicBool,
     sync_next: AtomicU64,
+    sync_peers: Mutex<Vec<PeerId>>,
+    sync_from: Mutex<Option<PeerId>>,
     parent: Mutex<Option<BlockHeader>>,
     proposal: Mutex<Option<Block>>,
     chain: Option<Arc<LiveChain>>,
@@ -360,21 +362,53 @@ async fn run(config: Config) -> Result<(), String> {
         }
         _ => {}
     }
-    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-        .map_err(|err| err.to_string())?;
-    loop {
-        tokio::select! {
-            _ = terminate.recv() => {
-                network.handle().shutdown().map_err(|err| err.to_string())?;
-                while network.next_event().await.is_some() {}
-                return Ok(());
-            }
-            event = network.next_event() => {
-                match event {
-                    Some(event) => {
-                        dispatch(pool.as_ref(), duty.as_ref(), &handshakes, network.handle(), event)
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .map_err(|err| err.to_string())?;
+        loop {
+            tokio::select! {
+                _ = terminate.recv() => {
+                    network.handle().shutdown().map_err(|err| err.to_string())?;
+                    while network.next_event().await.is_some() {}
+                    return Ok(());
+                }
+                event = network.next_event() => {
+                    match event {
+                        Some(event) => {
+                            dispatch(pool.as_ref(), duty.as_ref(), &handshakes, network.handle(), event)
+                        }
+                        None => return Ok(()),
                     }
-                    None => return Ok(()),
+                }
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 8];
+            let _ = std::io::Read::read(&mut std::io::stdin(), &mut buf);
+            let _ = tx.send(());
+        });
+        loop {
+            tokio::select! {
+                _ = &mut rx => {
+                    say("fase shutdown-inicio");
+                    network.handle().shutdown().map_err(|err| err.to_string())?;
+                    while network.next_event().await.is_some() {}
+                    say("fase shutdown-fin");
+                    return Ok(());
+                }
+                event = network.next_event() => {
+                    match event {
+                        Some(event) => {
+                            dispatch(pool.as_ref(), duty.as_ref(), &handshakes, network.handle(), event)
+                        }
+                        None => return Ok(()),
+                    }
                 }
             }
         }
@@ -511,7 +545,6 @@ fn open_network_key(path: Option<&str>) -> Result<libp2p::identity::Keypair, Str
 }
 
 fn write_network_key(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
-    use std::os::unix::fs::OpenOptionsExt;
     let name = path
         .file_name()
         .and_then(|name| name.to_str())
@@ -520,10 +553,14 @@ fn write_network_key(path: &std::path::Path, bytes: &[u8]) -> Result<(), String>
     if tmp.exists() && !path.exists() {
         std::fs::remove_file(&tmp).map_err(|_| "network identity".to_string())?;
     }
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut file = opts
         .open(&tmp)
         .map_err(|_| "network identity".to_string())?;
     file.write_all(bytes)
@@ -758,8 +795,20 @@ fn dispatch(
         NetworkEvent::HandshakeAccepted(peer) => {
             report(NetworkEvent::HandshakeAccepted(peer));
             if let Some(duty) = duty {
+                note_handshake(duty, peer);
                 if duty.pull && !duty.sync_started.swap(true, Ordering::Relaxed) {
                     request_height(duty, handle, peer, sync_start(duty));
+                }
+            }
+        }
+        NetworkEvent::PeerDisconnected(peer) => {
+            report(NetworkEvent::PeerDisconnected(peer));
+            if let Some(duty) = duty {
+                if let Some(other) = drop_sync_peer(duty, peer) {
+                    if duty.pull {
+                        let height = duty.sync_next.load(Ordering::Relaxed);
+                        request_height(duty, handle, other, height);
+                    }
                 }
             }
         }
@@ -949,6 +998,8 @@ fn pack_duty(
         audit: false,
         sync_started: AtomicBool::new(false),
         sync_next: AtomicU64::new(1),
+        sync_peers: Mutex::new(Vec::new()),
+        sync_from: Mutex::new(None),
         parent: Mutex::new(None),
         proposal: Mutex::new(None),
         chain: None,
@@ -2055,6 +2106,8 @@ fn open_produce(config: &Config, opts: ProduceOpts) -> Result<(Arc<LiveChain>, A
         audit: opts.audit,
         sync_started: AtomicBool::new(false),
         sync_next: AtomicU64::new(1),
+        sync_peers: Mutex::new(Vec::new()),
+        sync_from: Mutex::new(None),
         parent: Mutex::new(None),
         proposal: Mutex::new(None),
         chain: Some(Arc::clone(&chain)),
@@ -2485,7 +2538,31 @@ fn sync_start(duty: &Duty) -> u64 {
     }
 }
 
+fn note_handshake(duty: &Duty, peer: PeerId) {
+    if let Ok(mut peers) = duty.sync_peers.lock() {
+        if !peers.contains(&peer) {
+            peers.push(peer);
+        }
+    }
+}
+
+fn drop_sync_peer(duty: &Duty, peer: PeerId) -> Option<PeerId> {
+    let source = duty.sync_from.lock().ok().and_then(|slot| *slot);
+    let Ok(mut peers) = duty.sync_peers.lock() else {
+        return None;
+    };
+    peers.retain(|id| *id != peer);
+    if source == Some(peer) {
+        peers.first().copied()
+    } else {
+        None
+    }
+}
+
 fn request_height(duty: &Duty, handle: &NetworkHandle, peer: PeerId, height: u64) {
+    if let Ok(mut slot) = duty.sync_from.lock() {
+        *slot = Some(peer);
+    }
     duty.sync_next.store(height, Ordering::Relaxed);
     say(&format!("sync-request {height}"));
     if handle
@@ -2743,6 +2820,30 @@ fn classify(duty: &Duty, bytes: &[u8]) -> Result<Block, String> {
     Ok(block)
 }
 
+enum SyncStop {
+    Reject(String),
+    AuditHold,
+}
+
+fn accept_synced_block(duty: &Duty, bytes: &[u8]) -> Result<Option<u64>, SyncStop> {
+    let block = classify(duty, bytes).map_err(SyncStop::Reject)?;
+    let Some(chain) = duty.chain.as_ref() else {
+        return Ok(None);
+    };
+    write_committed(chain, &block).map_err(SyncStop::Reject)?;
+    if duty.audit {
+        return Err(SyncStop::AuditHold);
+    }
+    let hash = block.block_hash().map_err(|_| SyncStop::Reject("invalid block".into()))?;
+    say(&format!(
+        "synced {} {} {}",
+        block.header.height.0,
+        encode_hex(&hash.0 .0),
+        encode_hex(&block.header.previous_block_hash.0 .0)
+    ));
+    Ok(block.header.height.0.checked_add(1))
+}
+
 fn take_sync(duty: &Arc<Duty>, handle: &NetworkHandle, peer: PeerId, response: RscResponse) {
     if !duty.pull {
         return;
@@ -2762,56 +2863,29 @@ fn take_sync(duty: &Arc<Duty>, handle: &NetworkHandle, peer: PeerId, response: R
             }
         }
         RscResponse::Blocks { payloads } => {
-            let Some(bytes) = payloads.first() else {
-                say("sync-rejected invalid encoding");
-                if duty.audit {
-                    audit_next(duty, handle, peer);
-                }
-                return;
-            };
-            if payloads.len() != 1 {
+            if rsc_p2p::range_len(&payloads).is_err() {
                 say("sync-rejected invalid encoding");
                 if duty.audit {
                     audit_next(duty, handle, peer);
                 }
                 return;
             }
-            let block = match classify(duty, bytes) {
-                Ok(block) => block,
-                Err(err) => {
+            let walked = rsc_p2p::apply_in_order(&payloads, |bytes| {
+                accept_synced_block(duty, bytes)
+            });
+            match walked {
+                Ok(steps) => {
+                    if let Some(next) = steps.into_iter().flatten().last() {
+                        request_height(duty, handle, peer, next);
+                    }
+                }
+                Err(SyncStop::AuditHold) => say("sync-rejected invalid block"),
+                Err(SyncStop::Reject(err)) => {
                     say(&format!("sync-rejected {err}"));
                     if duty.audit {
                         audit_next(duty, handle, peer);
                     }
-                    return;
                 }
-            };
-            let Some(chain) = duty.chain.as_ref() else {
-                return;
-            };
-            if let Err(err) = write_committed(chain, &block) {
-                say(&format!("sync-rejected {err}"));
-                if duty.audit {
-                    audit_next(duty, handle, peer);
-                }
-                return;
-            }
-            if duty.audit {
-                say("sync-rejected invalid block");
-                return;
-            }
-            let Ok(hash) = block.block_hash() else {
-                say("sync-rejected invalid block");
-                return;
-            };
-            say(&format!(
-                "synced {} {} {}",
-                block.header.height.0,
-                encode_hex(&hash.0 .0),
-                encode_hex(&block.header.previous_block_hash.0 .0)
-            ));
-            if let Some(next) = block.header.height.0.checked_add(1) {
-                request_height(duty, handle, peer, next);
             }
         }
         RscResponse::Handshake(_) => say("sync-rejected invalid encoding"),

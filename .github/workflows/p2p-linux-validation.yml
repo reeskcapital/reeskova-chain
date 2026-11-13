@@ -1,0 +1,52 @@
+name: Validación P2P en Linux
+
+on:
+  push:
+    branches:
+      - ci/p2p-linux-validation
+  workflow_dispatch:
+
+concurrency:
+  group: p2p-linux-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  processes:
+    name: two_processes, biblioteca y nodo
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - name: Obtener el código
+        uses: actions/checkout@v4
+
+      - name: Instalar Rust 1.95.0
+        uses: dtolnay/rust-toolchain@1.95.0
+
+      - name: Instalar dependencias de compilación
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake pkg-config clang libclang-dev llvm
+          echo "LIBCLANG_PATH=$(llvm-config --libdir)" >> "$GITHUB_ENV"
+
+      - name: Registrar versiones
+        run: |
+          rustc --version
+          cargo --version
+
+      - name: Compilar las pruebas de rsc-p2p y rsc-node
+        run: |
+          cargo test -p rsc-p2p --test two_processes --no-run --color=never
+          cargo test -p rsc-p2p --lib --no-run --color=never
+          cargo test -p rsc-node --bin rsc-node --no-run --color=never
+
+      - name: Test individual de puerto e identidad
+        run: cargo test -p rsc-p2p --test two_processes devnet_rejects_mismatched_identity_and_busy_ports -- --test-threads=1 --color=never
+
+      - name: Suite completa two_processes
+        run: cargo test -p rsc-p2p --test two_processes -- --test-threads=1 --color=never
+
+      - name: Pruebas de biblioteca rsc-p2p
+        run: cargo test -p rsc-p2p --lib -- --color=never
+
+      - name: Pruebas de rsc-node
+        run: cargo test -p rsc-node --bin rsc-node -- --test-threads=1 --color=never

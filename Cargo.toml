@@ -20,6 +20,7 @@ members = [
     "crates/rsc-assets",
     "crates/rsc-monetary",
     "crates/rsc-node-tiers",
+    "crates/rsc-registry",
     "network/node",
     "network/validator",
     "network/mobile-node",

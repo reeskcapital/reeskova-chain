@@ -18,6 +18,7 @@ rsc-ledger = { path = "../../crates/rsc-ledger" }
 rsc-monetary = { path = "../../crates/rsc-monetary" }
 rsc-mempool = { path = "../../crates/rsc-mempool" }
 rsc-p2p = { path = "../../crates/rsc-p2p" }
+rsc-registry = { path = "../../crates/rsc-registry", default-features = false }
 rsc-rpc = { path = "../../crates/rsc-rpc" }
 rsc-state = { path = "../../crates/rsc-state" }
 rsc-storage = { path = "../../crates/rsc-storage" }
